@@ -39,6 +39,7 @@ agent86 --run hello.com
 > PowerShell:  .\agent86.exe --agent source.asm
 > cmd:         agent86.exe --agent source.asm
 > ```
+> **PowerShell 5.x encoding trap:** The `>` redirect operator in PowerShell 5.x silently re-encodes output as UTF-16LE, which breaks JSON parsers. Use `--output-file result.json` instead of shell redirection, or upgrade to PowerShell 7+ where `>` defaults to UTF-8.
 
 ---
 
@@ -65,6 +66,10 @@ agent86 --run hello.com
 | `--max-cycles <N>` | Maximum CPU cycles before forced halt. | 1000000 |
 | `--input <string>` | Provide stdin input for the program (consumed by INT 21h/01h and 06h). | Empty |
 | `--mem-dump <addr,len>` | Include memory dump in breakpoint snapshots. Address in hex, length in decimal. | None |
+| `--screen` | **Capture full 80×50 screen** from VRAM into JSON output. | Off |
+| `--viewport <col,row,w,h>` | **Capture a rectangular region** of the screen. Implies `--screen` behavior but only for the specified window. | Off |
+| `--attrs` | **Include attribute bytes** in screen output. Emits `screenAttrs[]` alongside `screen[]`. | Off |
+| `--output-file <path>` | **Write JSON to file** instead of stdout. Bypasses shell encoding issues (no BOM, no re-encoding). | stdout |
 
 ### Flag Usage Patterns
 
@@ -107,6 +112,31 @@ agent86 --dump-isa
 **Disassembling a compiled binary for verification:**
 ```bash
 agent86 --disassemble output.com
+```
+
+**Run a VRAM program and capture the full screen:**
+```bash
+agent86 --run-source life.asm --screen
+```
+
+**Capture just a 40×25 window from the top-left:**
+```bash
+agent86 --run-source life.asm --viewport 0,0,40,25
+```
+
+**Include color/attribute data in screen output:**
+```bash
+agent86 --run-source colors.asm --screen --attrs
+```
+
+**Animate with breakpoints — capture screen at each generation:**
+```bash
+agent86 --run-source life.asm --viewport 0,0,40,40 --breakpoints 0150
+```
+
+**Write output to file (avoids PowerShell encoding issues):**
+```bash
+agent86 --run-source life.asm --screen --output-file result.json
 ```
 
 ---
@@ -201,12 +231,17 @@ The `--run-source` flag assembles a source file and immediately runs the resulti
     "finalState": {
       "registers": {"AX": "0x0900", "CX": "0x0000", "DX": "0x0112", "BX": "0x0000", "SP": "0xFFFE", "BP": "0x0000", "SI": "0x0000", "DI": "0x0000"},
       "IP": "0x0110",
-      "flags": "0x0246"
+      "flags": "0x0246",
+      "cursor": {"row": 1, "col": 0}
     },
-    "skipped": []
+    "skipped": [],
+    "screen": ["Hello, World!                    ..."],
+    "screenAttrs": ["0707070707070707..."]
   }
 }
 ```
+
+> **Note:** `screen[]`, `screenAttrs[]`, and `cursor` are always present in `finalState`. The `screen` and `screenAttrs` arrays only appear when `--screen` or `--viewport` is used. Without those flags, screen data is omitted to keep output compact.
 
 If assembly fails, the `emulation` section will have `success: false` with no meaningful state.
 
@@ -239,6 +274,11 @@ If assembly fails, the `emulation` section will have `success: false` with no me
 - `IP`: Instruction pointer as hex string.
 - `flags`: Flags register as hex string.
 - `flagBits` (in `--run` mode): Individual flag values as booleans: CF, PF, AF, ZF, SF, OF, DF, IF.
+- `cursor`: VRAM cursor position as `{"row": N, "col": N}`. Always present. Tracks where INT 10h teletype output will write next.
+
+**`screen[]`** — *(Only present when `--screen` or `--viewport` is used.)* Array of strings, one per row. Each string contains the visible text characters from the VRAM viewport. Non-printable bytes are replaced with `.` for clean JSON. Without `--screen`/`--viewport`, this field is omitted entirely to keep output compact.
+
+**`screenAttrs[]`** — *(Only present when `--attrs` is also used.)* Array of strings, one per row, parallel to `screen[]`. Each string contains two hex digits per cell representing the CGA text-mode attribute byte (e.g., `"07"` = light grey on black, `"1F"` = white on blue). Omitted unless `--attrs` is specified.
 
 **`skipped[]`** — Instructions that were encountered but not fully emulated (e.g., unimplemented interrupts, I/O ports). Each entry:
 - `instruction`: Disassembly text of the skipped instruction.
@@ -254,7 +294,10 @@ The `--run` flag runs a pre-compiled `.COM` binary. The JSON output is the same 
 
 - `finalState.sregs`: Segment registers (ES, CS, SS, DS) as hex strings.
 - `finalState.flagBits`: Individual flags as booleans.
+- `finalState.cursor`: VRAM cursor position as `{"row": N, "col": N}`.
 - `snapshots[]`: Breakpoint and watchpoint snapshots (see Breakpoints section).
+- `screen[]`: Screen text (when `--screen` or `--viewport` is used).
+- `screenAttrs[]`: Attribute hex strings (when `--attrs` is also used).
 
 ---
 
@@ -275,11 +318,14 @@ Each snapshot contains:
 - `nextInst`: Disassembly of the instruction about to execute.
 - `registers`: All 8 registers as hex.
 - `flags`: Flags register as hex.
+- `cursor`: VRAM cursor position as `{"row": N, "col": N}`.
 - `stack`: Top 8 words from the stack.
 - `memDump`: Hex string of memory region (if `--mem-dump` is configured).
-- `hitCount`: Number of times this address has been hit.
+- `screen[]`: Screen text at this snapshot (if `--screen` or `--viewport` is used).
+- `screenAttrs[]`: Attribute data at this snapshot (if `--attrs` is used).
+- `hitCount`: Number of times this address has been hit (for the 10th and final snapshot, this accumulates all subsequent hits).
 
-Snapshots are limited to 10 full captures per address. After that, only the hit count increments.
+Snapshots are limited to 10 full captures per breakpoint address. The first 10 hits each produce a complete snapshot with distinct register state, screen content, and cursor position — ideal for watching animations or game-of-life grids evolve frame by frame. After 10 hits, only the `hitCount` on the last snapshot increments. Total snapshots across all addresses are capped at 100.
 
 ### Register Watchpoints (`--watch-regs`)
 
@@ -549,6 +595,69 @@ All shift and rotate instructions accept both register and memory destinations. 
 
 The emulator handles the following interrupts. All others are logged in the `skipped[]` array.
 
+### INT 10h — BIOS Video Services
+
+The emulator provides an 8KB VRAM buffer (segment `B800h`, offsets `0000h–1F3Fh`) representing an 80×50 CGA text-mode screen. Each cell is 2 bytes: character byte followed by attribute byte. Programs can write to VRAM directly via `ES:DI` with segment `B800h`, or use INT 10h services below.
+
+Text output via INT 21h (functions 02h, 06h, 09h) produces **dual output**: characters appear in both the `output` string and the VRAM buffer. This means `--screen` captures everything a program prints, whether it uses DOS calls or direct VRAM writes.
+
+| AH | Function | Behavior |
+|---|---|---|
+| `00h` | Set video mode | AL=mode. Accepted but only mode 3 (80×25 color text) is meaningful. Clears screen. |
+| `02h` | Set cursor position | DH=row, DL=column, BH=page (ignored). Moves the VRAM write cursor. |
+| `03h` | Get cursor position | Returns DH=row, DL=column, CX=cursor shape. BH=page (ignored). |
+| `06h` | Scroll window up | AL=lines (0=clear window). BH=fill attribute. CH,CL=top-left row,col. DH,DL=bottom-right row,col. |
+| `07h` | Scroll window down | Same parameters as AH=06h but scrolls content downward. |
+| `08h` | Read char/attr at cursor | Returns AL=character, AH=attribute at current cursor position. |
+| `09h` | Write char+attr at cursor | AL=char, BL=attr, CX=repeat count. Does NOT advance cursor. |
+| `0Ah` | Write char at cursor | AL=char, CX=repeat count. Keeps existing attribute. Does NOT advance cursor. |
+| `0Eh` | Teletype output | AL=char. Writes character at cursor and advances. Handles CR (0Dh), LF (0Ah), BS (08h). Scrolls screen when cursor passes bottom row. |
+| `0Fh` | Get video mode | Returns AL=3 (mode), AH=80 (columns), BH=0 (page). |
+
+> **Common pattern — clear screen with color:**
+> ```asm
+> MOV AX, 0600h       ; AH=06 (scroll up), AL=0 (clear entire window)
+> MOV BH, 1Fh         ; Fill attribute: white on blue
+> XOR CX, CX          ; CH=0, CL=0 (top-left corner)
+> MOV DH, 24          ; Bottom row (24 for 25-line mode)
+> MOV DL, 79          ; Right column
+> INT 10h
+> ```
+
+> **Common pattern — set cursor then print:**
+> ```asm
+> MOV AH, 02h         ; Set cursor position
+> MOV DH, 5           ; Row 5
+> MOV DL, 10          ; Column 10
+> XOR BH, BH          ; Page 0
+> INT 10h
+> MOV AH, 0Eh         ; Teletype output
+> MOV AL, 'A'
+> INT 10h             ; Writes 'A' at row 5, col 10
+> ```
+
+### CGA Text-Mode Attribute Byte
+
+The attribute byte at each VRAM cell controls foreground and background color:
+
+```
+  Bit 7    Bits 6-4    Bits 3-0
+  Blink    Background  Foreground
+```
+
+| Value | Color | Value | Color |
+|---|---|---|---|
+| `0` | Black | `8` | Dark Grey |
+| `1` | Blue | `9` | Light Blue |
+| `2` | Green | `A` | Light Green |
+| `3` | Cyan | `B` | Light Cyan |
+| `4` | Red | `C` | Light Red |
+| `5` | Magenta | `D` | Light Magenta |
+| `6` | Brown | `E` | Yellow |
+| `7` | Light Grey | `F` | White |
+
+Common attribute values: `07h` = light grey on black (default), `1Fh` = white on blue, `4Eh` = yellow on red, `0Fh` = bright white on black.
+
 ### INT 20h — Program Terminate
 
 Halts emulation with `exitCode: 0`. This is the standard .COM termination method. A program that returns with an empty stack (RET when SP=FFFEh) will execute the `INT 20h` at address 0000h (placed there by the emulator as a PSP stub).
@@ -710,10 +819,16 @@ MOV AX, 5    ; This is a comment
       d. Use emulation.outputHex for byte-level comparison
       e. Check emulation.skipped[] for unimplemented instructions
       f. If fidelity < 1.0, some instructions were not fully emulated
-6.  If debugging is needed:
+6.  For VRAM programs, add --screen or --viewport:
+      a. Re-run:  agent86 --run-source source.asm --screen
+      b. Check emulation.screen[] for expected display content
+      c. Check emulation.finalState.cursor for cursor position
+      d. Add --attrs to inspect color attributes if display looks wrong
+7.  If debugging is needed:
       a. Re-run with --breakpoints at suspect addresses
       b. Add --watch-regs to track register changes
       c. Inspect snapshots[] for state at each breakpoint
+      d. For VRAM programs, snapshots include screen[] at each hit
 ```
 
 ### Assembly-Only Loop
@@ -766,6 +881,20 @@ agent86 --run-source source.asm --breakpoints 0110,0120 --watch-regs AX,DX
 
 The `snapshots[]` array will contain a full state dump at each breakpoint, including the stack and the next instruction to execute. Register watchpoints capture every change, making it easy to trace data flow.
 
+### Debugging VRAM Programs
+
+For programs that write to the screen (games, TUI apps, Conway's Life, etc.), add `--screen` or `--viewport` together with `--breakpoints` to capture the screen at each breakpoint hit. Each of the first 10 snapshots at a given address includes a full `screen[]` array, letting you watch the display evolve frame by frame:
+
+```bash
+# Capture a 40x25 viewport at each iteration of a game loop
+agent86 --run-source life.asm --viewport 0,0,40,25 --breakpoints 0150
+
+# Write to file to avoid shell encoding issues
+agent86 --run-source life.asm --screen --breakpoints 0150 --output-file frames.json
+```
+
+Each snapshot in the JSON contains independent `screen[]` and `cursor` data, so you can diff consecutive snapshots to see exactly what changed between frames.
+
 ### Diagnosing Garbage Output
 
 If the program output looks wrong (garbled, too short, or empty):
@@ -774,6 +903,8 @@ If the program output looks wrong (garbled, too short, or empty):
 2. Check `finalState.registers.DX` — for INT 21h/09h, DX points to the string. A wrong DX value means a bad pointer.
 3. Check `diagnostics[]` — if output was truncated (no `$` terminator found), a diagnostic will report the bad DX address.
 4. Re-run with `--breakpoints` just before the INT 21h call to inspect register state.
+5. For VRAM programs, add `--screen` to see what's actually on the virtual display. If `output` is empty but `screen[]` shows text, the program is using direct VRAM writes instead of DOS output calls.
+6. Add `--attrs` to check color attributes — a common bug is writing text with attribute `00h` (black on black), making it invisible.
 
 ### Diagnostic-Driven Fixing
 
@@ -889,6 +1020,51 @@ start:
 message DB 'Hello, World!', 0Dh, 0Ah, '$'
 ```
 
+### Direct VRAM Text Output
+
+```asm
+ORG 100h
+
+; Set up ES to point to VRAM
+MOV AX, 0B800h
+MOV ES, AX
+
+; Write 'Hi' at top-left with white-on-blue attribute (1Fh)
+; VRAM layout: [char][attr][char][attr]...
+; Offset 0 = row 0, col 0. Offset 2 = row 0, col 1.
+XOR DI, DI          ; ES:DI -> start of VRAM
+MOV AX, 1F48h       ; 'H' (48h) with attr 1Fh
+STOSW               ; Write to [0], DI += 2
+MOV AX, 1F69h       ; 'i' (69h) with attr 1Fh
+STOSW               ; Write to [2], DI += 2
+
+MOV AH, 4Ch
+INT 21h
+```
+
+Run with `agent86 --run-source vram_hi.asm --viewport 0,0,10,1 --attrs` to see:
+```json
+"screen": ["Hi        "],
+"screenAttrs": ["1F1F0707070707070707"]
+```
+
+### Fill Screen with Color using REP STOSW
+
+```asm
+ORG 100h
+
+MOV AX, 0B800h
+MOV ES, AX
+XOR DI, DI
+MOV CX, 4000        ; 80 cols * 50 rows = 4000 cells
+MOV AX, 1F20h       ; Space (20h) with white-on-blue (1Fh)
+CLD
+REP STOSW            ; Fill entire screen
+
+MOV AH, 4Ch
+INT 21h
+```
+
 ### Subroutine Call Convention
 
 ```asm
@@ -996,10 +1172,31 @@ hex_table: DB '0123456789ABCDEF'
 
 ### Memory Layout
 
-The emulator initializes a flat 64KB memory space:
+The emulator initializes a flat 64KB memory space plus a separate VRAM buffer:
 - **0000h-0001h**: `CD 20` (INT 20h) — PSP termination stub. If a program does `RET` with an empty stack, IP goes to 0000h and executes INT 20h for a clean exit.
 - **0100h onwards**: Program binary loaded here (standard .COM load address).
 - **FFFEh**: Initial stack pointer (grows downward).
+- **Segment B800h (B8000h–B9F3Fh)**: 8KB VRAM buffer for 80×50 CGA text-mode display. Each cell is 2 bytes: `[character][attribute]`. Reads and writes via segment `B800h` are intercepted and routed to this buffer. See the VRAM section below.
+
+### VRAM and Screen Capture
+
+The emulator maintains a separate 8KB VRAM buffer mapped at segment `B800h` (physical addresses `B8000h–B9F3Fh`). This is a faithful model of CGA text-mode video memory: 80 columns × 50 rows × 2 bytes per cell = 8000 bytes.
+
+Programs write to VRAM in two ways, both fully supported:
+
+1. **Direct VRAM writes** — Set `ES` to `B800h` and write character/attribute pairs via `MOV`, `STOSW`, `REP STOSW`, etc. This is how high-performance DOS programs (games, demos, TUI apps) render their displays.
+
+2. **INT 10h services** — Use BIOS video interrupts for cursor positioning, teletype output, scrolling, and screen clearing. See the INT 10h section under Emulated Interrupts.
+
+Additionally, all DOS text output (INT 21h functions 02h, 06h, 09h) is mirrored to VRAM automatically — characters appear at the current cursor position and the cursor advances. This means `--screen` captures output from both DOS and BIOS paths.
+
+**Screen capture** is controlled by `--screen` and `--viewport`:
+- Without either flag: no `screen[]` array in JSON output. The VRAM is still maintained internally (INT 10h works correctly), but its contents are not serialized. This keeps output compact for programs that don't use VRAM.
+- `--screen`: Captures the full 80×50 grid as 50 strings of 80 characters each.
+- `--viewport 0,0,40,25`: Captures only the specified rectangle (col, row, width, height). Useful for focusing on the active area of a program that only uses part of the screen.
+- `--attrs`: Adds a parallel `screenAttrs[]` array containing hex-encoded attribute bytes (2 hex digits per cell). Omitted by default since most debugging only needs the text.
+
+**Dual output** means a "Hello World" program using INT 21h/09h will show `"Hello World"` in both the `output` field and the `screen[]` array (at the cursor position). The `output` field captures the raw byte stream; `screen[]` captures the spatial layout on the virtual monitor.
 
 ### Self-Modifying Code
 
@@ -1032,7 +1229,7 @@ All program output is JSON-safe regardless of what bytes the program produces:
 8. **Duplicate labels emit a warning.** Redefining a label overwrites the previous value but emits a `WARNING` diagnostic with the previous definition line.
 9. **No `TIMES` directive.** Use `RESB` for zero-fill or `DB` with comma-separated repeated values.
 10. **Emulator: I/O ports not emulated.** `IN` and `OUT` instructions are logged as skipped.
-11. **Emulator: Limited DOS interrupt support.** Only INT 20h and INT 21h (functions 01h, 02h, 06h, 09h, 2Ah, 2Ch, 30h, 4Ch) are handled. Other interrupts are logged as skipped.
+11. **Emulator: Limited DOS/BIOS interrupt support.** INT 20h, INT 21h (functions 01h, 02h, 06h, 09h, 2Ah, 2Ch, 30h, 4Ch), and INT 10h (functions 00h, 02h, 03h, 06h, 07h, 08h, 09h, 0Ah, 0Eh, 0Fh) are handled. INT 10h font services (AH=11h) are not implemented. Other interrupts are logged as skipped.
 12. **Emulator: No hardware interrupt simulation.** Timer, keyboard, and other hardware interrupts are not generated.
 
 ---
