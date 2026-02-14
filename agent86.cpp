@@ -2978,14 +2978,131 @@ struct CPU {
 
 struct Memory {
     uint8_t data[65536] = {};
+    uint8_t vram[8000] = {};       // 80x50x2 bytes (char + attr interleaved)
+    bool vramDirty = false;         // Track if VRAM was touched this cycle
+
+    // === Legacy flat access (keep for backward compat) ===
     uint8_t read8(uint16_t addr) const { return data[addr]; }
-    uint16_t read16(uint16_t addr) const { return data[addr] | ((uint16_t)data[(uint16_t)(addr + 1)] << 8); }
+    uint16_t read16(uint16_t addr) const {
+        return data[addr] | ((uint16_t)data[(uint16_t)(addr + 1)] << 8);
+    }
     void write8(uint16_t addr, uint8_t val) { data[addr] = val; }
-    void write16(uint16_t addr, uint16_t val) { data[addr] = (uint8_t)(val & 0xFF); data[(uint16_t)(addr + 1)] = (uint8_t)(val >> 8); }
+    void write16(uint16_t addr, uint16_t val) {
+        data[addr] = (uint8_t)(val & 0xFF);
+        data[(uint16_t)(addr + 1)] = (uint8_t)(val >> 8);
+    }
+
+    // === New: Segment-aware access ===
+    uint8_t sread8(uint16_t seg, uint16_t off) const {
+        uint32_t linear = (uint32_t)seg * 16 + off;
+        if (linear >= 0xB8000 && linear < 0xB9F40)
+            return vram[linear - 0xB8000];
+        return data[off & 0xFFFF];   // Flat fallback
+    }
+
+    uint16_t sread16(uint16_t seg, uint16_t off) const {
+        uint32_t linear = (uint32_t)seg * 16 + off;
+        if (linear >= 0xB8000 && linear < 0xB9F40) {
+            uint32_t idx = linear - 0xB8000;
+            uint8_t lo = vram[idx];
+            uint8_t hi = (idx + 1 < 8000) ? vram[idx + 1] : 0;
+            return lo | ((uint16_t)hi << 8);
+        }
+        return data[off & 0xFFFF] |
+               ((uint16_t)data[(uint16_t)((off + 1) & 0xFFFF)] << 8);
+    }
+
+    void swrite8(uint16_t seg, uint16_t off, uint8_t val) {
+        uint32_t linear = (uint32_t)seg * 16 + off;
+        if (linear >= 0xB8000 && linear < 0xB9F40) {
+            vram[linear - 0xB8000] = val;
+            vramDirty = true;
+            return;
+        }
+        data[off & 0xFFFF] = val;
+    }
+
+    void swrite16(uint16_t seg, uint16_t off, uint16_t val) {
+        uint32_t linear = (uint32_t)seg * 16 + off;
+        if (linear >= 0xB8000 && linear < 0xB9F40) {
+            uint32_t idx = linear - 0xB8000;
+            vram[idx] = (uint8_t)(val & 0xFF);
+            if (idx + 1 < 8000) vram[idx + 1] = (uint8_t)(val >> 8);
+            vramDirty = true;
+            return;
+        }
+        data[off & 0xFFFF] = (uint8_t)(val & 0xFF);
+        data[(uint16_t)((off + 1) & 0xFFFF)] = (uint8_t)(val >> 8);
+    }
+
     void loadCOM(const vector<uint8_t>& binary) {
         size_t len = binary.size();
         if (len > 65536 - 0x100) len = 65536 - 0x100;
         for (size_t i = 0; i < len; i++) data[0x100 + i] = binary[i];
+    }
+};
+
+struct VRAMState {
+    uint8_t cursorRow = 0;
+    uint8_t cursorCol = 0;
+    uint8_t defaultAttr = 0x07;  // Light grey on black
+    int cols = 80;
+    int rows = 50;
+    // Note: actual VRAM storage is in Memory::vram[8000]
+
+    uint16_t cursorOffset() const {
+        return (uint16_t)(cursorRow * cols + cursorCol) * 2;
+    }
+
+    void advance(Memory& mem) {
+        cursorCol++;
+        if (cursorCol >= cols) {
+            cursorCol = 0;
+            cursorRow++;
+            if (cursorRow >= rows) {
+                scrollUp(mem, 1);
+                cursorRow = rows - 1;
+            }
+        }
+    }
+
+    void scrollUp(Memory& mem, int lines) {
+        int bytesPerRow = cols * 2;
+        int shiftBytes = lines * bytesPerRow;
+        int totalBytes = rows * bytesPerRow;
+        // Shift VRAM up
+        // Using manual move as memmove might not be available or risky with overlap in pure C++ without headers
+        // But headers are included.
+        // memmove(mem.vram, mem.vram + shiftBytes, totalBytes - shiftBytes);
+        for(int i=0; i < totalBytes - shiftBytes; ++i) {
+             mem.vram[i] = mem.vram[i + shiftBytes];
+        }
+        
+        // Clear bottom lines
+        for (int i = totalBytes - shiftBytes; i < totalBytes; i += 2) {
+            mem.vram[i] = ' ';
+            mem.vram[i + 1] = defaultAttr;
+        }
+        mem.vramDirty = true;
+    }
+
+    void writeCharAtCursor(Memory& mem, uint8_t ch, uint8_t attr) {
+        uint16_t off = cursorOffset();
+        if (off + 1 < 8000) {
+            mem.vram[off] = ch;
+            mem.vram[off + 1] = attr;
+            mem.vramDirty = true;
+        }
+    }
+
+    void clearScreen(Memory& mem) {
+        for (int i = 0; i < rows * cols * 2; i += 2) {
+            mem.vram[i] = ' ';
+            mem.vram[i + 1] = defaultAttr;
+        }
+        cursorRow = 0;
+        cursorCol = 0;
+        mem.vramDirty = true;
     }
 };
 
@@ -3007,6 +3124,13 @@ struct EmulatorConfig {
     uint16_t memDumpAddr = 0;
     int memDumpLen = 0;
     string stdinInput;
+    // --- Output ---
+    string outputFile;              // --output-file path (empty = stdout)
+    // --- VRAM viewport ---
+    bool hasViewport = false;       // Only emit screen data if true
+    int vpCol = 0, vpRow = 0;      // Top-left corner of viewport
+    int vpWidth = 80, vpHeight = 50; // Viewport dimensions
+    bool vpAttrs = false;           // Include attribute data in output
 };
 
 struct Snapshot {
@@ -3021,6 +3145,12 @@ struct Snapshot {
     vector<uint8_t> memDump;
     int hitCount = 1;
     string reason;
+    // --- VRAM viewport at this snapshot ---
+    vector<string> screenLines;
+    vector<string> screenAttrs;
+    // --- Cursor at snapshot ---
+    int snapCursorRow = 0;
+    int snapCursorCol = 0;
 };
 
 struct SkippedRecord {
@@ -3041,9 +3171,34 @@ struct EmulatorResult {
     vector<Snapshot> snapshots;
     vector<SkippedRecord> skipped;
     vector<string> diagnostics;
+    vector<string> screen;       // Viewport text rows (populated only with --screen/--viewport)
+    vector<string> screenAttrs;  // Viewport hex attribute rows (populated only with --attrs)
+    // --- Cursor ---
+    int cursorRow = 0;
+    int cursorCol = 0;
 };
 
 // --- Section 2: Core Engine ---
+
+// Returns the segment register value to use for a memory operand.
+// Respects: (1) explicit segment override prefix, (2) BP->SS default, (3) DS default.
+uint16_t resolveSegment(const CPU& cpu, const DecodedOperand& op, int segOverride) {
+    // Explicit override takes priority (except ES:DI for string destinations)
+    if (segOverride != -1) {
+        switch (segOverride) {
+            case 0x26: return cpu.sregs[0]; // ES
+            case 0x2E: return cpu.sregs[1]; // CS
+            case 0x36: return cpu.sregs[2]; // SS
+            case 0x3E: return cpu.sregs[3]; // DS
+        }
+    }
+    // BP-based addressing defaults to SS
+    if (op.memRM == 2 || op.memRM == 3 || op.memRM == 6) {
+        return cpu.sregs[2]; // SS
+    }
+    // Everything else defaults to DS
+    return cpu.sregs[3]; // DS
+}
 
 uint16_t calcEffectiveAddress(const CPU& cpu, const DecodedOperand& op) {
     int addr = 0;
@@ -3065,7 +3220,7 @@ uint16_t calcEffectiveAddress(const CPU& cpu, const DecodedOperand& op) {
     return (uint16_t)(addr & 0xFFFF);
 }
 
-uint16_t readOperand(const CPU& cpu, const Memory& mem, const DecodedOperand& op) {
+uint16_t readOperand(const CPU& cpu, const Memory& mem, const DecodedOperand& op, int segOverride = -1) {
     switch (op.kind) {
         case OpKind::REG8:  return cpu.getReg8(op.reg);
         case OpKind::REG16: return cpu.regs[op.reg];
@@ -3074,21 +3229,23 @@ uint16_t readOperand(const CPU& cpu, const Memory& mem, const DecodedOperand& op
         case OpKind::IMM16: return (uint16_t)(op.disp & 0xFFFF);
         case OpKind::MEM: {
             uint16_t addr = calcEffectiveAddress(cpu, op);
-            return (op.size == 8) ? mem.read8(addr) : mem.read16(addr);
+            uint16_t seg = resolveSegment(cpu, op, segOverride);
+            return (op.size == 8) ? mem.sread8(seg, addr) : mem.sread16(seg, addr);
         }
         default: return 0;
     }
 }
 
-bool writeOperand(CPU& cpu, Memory& mem, const DecodedOperand& op, uint16_t val, bool& memDirty) {
+bool writeOperand(CPU& cpu, Memory& mem, const DecodedOperand& op, uint16_t val, bool& memDirty, int segOverride = -1) {
     switch (op.kind) {
         case OpKind::REG8:  cpu.setReg8(op.reg, (uint8_t)val); return true;
         case OpKind::REG16: cpu.regs[op.reg] = val; return true;
         case OpKind::SREG:  cpu.sregs[op.reg] = val; return true;
         case OpKind::MEM: {
             uint16_t addr = calcEffectiveAddress(cpu, op);
-            if (op.size == 8) mem.write8(addr, (uint8_t)val);
-            else mem.write16(addr, val);
+            uint16_t seg = resolveSegment(cpu, op, segOverride);
+            if (op.size == 8) mem.swrite8(seg, addr, (uint8_t)val);
+            else mem.swrite16(seg, addr, val);
             memDirty = true;
             return true;
         }
@@ -3160,7 +3317,174 @@ bool evalCondition(const CPU& cpu, const string& mnemonic) {
 
 // --- Section 5: Interrupt Handling ---
 
-void handleInt21(CPU& cpu, Memory& mem, IOCapture& io, EmulatorResult& result) {
+void ttyCharToVRAM(Memory& mem, VRAMState& vram, uint8_t ch) {
+    if (ch == 0x0D) { // CR
+        vram.cursorCol = 0;
+    } else if (ch == 0x0A) { // LF
+        vram.cursorRow++;
+        if (vram.cursorRow >= vram.rows) {
+            vram.scrollUp(mem, 1);
+            vram.cursorRow = vram.rows - 1;
+        }
+    } else if (ch == 0x08) { // Backspace
+        if (vram.cursorCol > 0) vram.cursorCol--;
+    } else if (ch == 0x07) { // Bell - ignore
+    } else {
+        vram.writeCharAtCursor(mem, ch, vram.defaultAttr);
+        vram.advance(mem);
+    }
+}
+
+void handleInt10(CPU& cpu, Memory& mem, VRAMState& vram, EmulatorResult& result) {
+    uint8_t ah = cpu.getReg8(4);
+    switch (ah) {
+        case 0x00: { // Set video mode
+            // AL = mode. We only support text modes really, but let's just clear screen.
+            vram.clearScreen(mem);
+            break;
+        }
+        case 0x02: { // Set cursor position
+            uint8_t row = cpu.getReg8(6); // DH
+            uint8_t col = cpu.getReg8(2); // DL
+            // BH = page number (ignored)
+            if (row < vram.rows && col < vram.cols) {
+                vram.cursorRow = row;
+                vram.cursorCol = col;
+            }
+            break;
+        }
+        case 0x03: { // Get cursor position
+            // BH = page number (ignored)
+            cpu.setReg8(6, vram.cursorRow); // DH
+            cpu.setReg8(2, vram.cursorCol); // DL
+            cpu.regs[1] = 0x0607; // CX = cursor size (standard)
+            break;
+        }
+        case 0x06:   // Scroll up
+        case 0x07: { // Scroll down
+            uint8_t lines = cpu.getReg8(0); // AL (0 = clear window)
+            uint8_t attr  = cpu.getReg8(7); // BH = fill attribute (FIXED: was index 5)
+            uint8_t r1 = cpu.getReg8(5);    // CH = top row
+            uint8_t c1 = cpu.getReg8(1);    // CL = left col
+            uint8_t r2 = cpu.getReg8(6);    // DH = bottom row
+            uint8_t c2 = cpu.getReg8(2);    // DL = right col
+
+            // Clamp to screen bounds
+            if (r2 >= vram.rows) r2 = vram.rows - 1;
+            if (c2 >= vram.cols) c2 = vram.cols - 1;
+            if (r1 > r2 || c1 > c2) break; // Invalid window
+
+            if (lines == 0) {
+                // Clear the entire window
+                for (int r = r1; r <= r2; r++) {
+                    for (int c = c1; c <= c2; c++) {
+                        int off = (r * vram.cols + c) * 2;
+                        mem.vram[off] = ' ';
+                        mem.vram[off + 1] = attr;
+                    }
+                }
+            } else if (ah == 0x06) {
+                // Scroll UP by 'lines' rows within the window
+                for (int r = r1; r <= r2 - lines; r++) {
+                    for (int c = c1; c <= c2; c++) {
+                        int dst = (r * vram.cols + c) * 2;
+                        int src = ((r + lines) * vram.cols + c) * 2;
+                        mem.vram[dst] = mem.vram[src];
+                        mem.vram[dst + 1] = mem.vram[src + 1];
+                    }
+                }
+                // Clear vacated bottom rows
+                for (int r = max((int)r2 - lines + 1, (int)r1); r <= r2; r++) {
+                    for (int c = c1; c <= c2; c++) {
+                        int off = (r * vram.cols + c) * 2;
+                        mem.vram[off] = ' ';
+                        mem.vram[off + 1] = attr;
+                    }
+                }
+            } else {
+                // Scroll DOWN by 'lines' rows within the window
+                for (int r = r2; r >= r1 + lines; r--) {
+                    for (int c = c1; c <= c2; c++) {
+                        int dst = (r * vram.cols + c) * 2;
+                        int src = ((r - lines) * vram.cols + c) * 2;
+                        mem.vram[dst] = mem.vram[src];
+                        mem.vram[dst + 1] = mem.vram[src + 1];
+                    }
+                }
+                // Clear vacated top rows
+                for (int r = r1; r < min((int)r1 + lines, (int)r2 + 1); r++) {
+                    for (int c = c1; c <= c2; c++) {
+                        int off = (r * vram.cols + c) * 2;
+                        mem.vram[off] = ' ';
+                        mem.vram[off + 1] = attr;
+                    }
+                }
+            }
+            mem.vramDirty = true;
+            break;
+        }
+        case 0x08: { // Read char/attr at cursor
+            // BH = page (ignored)
+            uint16_t off = vram.cursorOffset();
+            if (off + 1 < 8000) {
+                cpu.setReg8(0, mem.vram[off]);     // AL = char
+                cpu.setReg8(4, mem.vram[off+1]);   // AH = attr
+            }
+            break;
+        }
+        case 0x09: { // Write char+attr at cursor, CX times, no cursor advance
+            uint8_t ch = cpu.getReg8(0);    // AL
+            uint8_t attr = cpu.getReg8(3);  // BL
+            uint16_t count = cpu.regs[1];   // CX = repeat count
+            // Writes character to consecutive cells starting at cursor position.
+            // Cursor position itself is NOT updated.
+            uint16_t off = vram.cursorOffset();
+            for (uint16_t i = 0; i < count; i++) {
+                uint16_t currentOff = off + i * 2;
+                if (currentOff + 1 < 8000) {
+                    mem.vram[currentOff] = ch;
+                    mem.vram[currentOff + 1] = attr;
+                }
+            }
+            mem.vramDirty = true;
+            break;
+        }
+        case 0x0A: { // Write char at cursor, keep existing attribute, CX times
+            uint8_t ch  = cpu.getReg8(0);   // AL
+            uint16_t cx = cpu.regs[1];      // CX = repeat count
+            // Does NOT advance cursor, does NOT change attribute
+            int col = vram.cursorCol;
+            int row = vram.cursorRow;
+            for (uint16_t i = 0; i < cx && row < vram.rows; i++) {
+                int off = (row * vram.cols + col) * 2;
+                if (off + 1 < 8000) {
+                    mem.vram[off] = ch;
+                    // attribute byte at off+1 left unchanged
+                }
+                col++;
+                if (col >= vram.cols) { col = 0; row++; }
+            }
+            mem.vramDirty = true;
+            break;
+        }
+        case 0x0E: { // Teletype output
+            uint8_t ch = cpu.getReg8(0);
+            ttyCharToVRAM(mem, vram, ch);
+            break;
+        }
+        case 0x0F: { // Get video mode
+            cpu.setReg8(0, 3);    // AL = mode 3 (80x25 color text)
+            cpu.setReg8(4, 80);   // AH = number of columns
+            cpu.setReg8(7, 0);    // BH = active page
+            break;
+        }
+        default:
+            result.skipped.push_back({ cpu.ip, "INT 10h AH=" + hexByte(ah), "Unimplemented Video function", 1 });
+            break;
+    }
+}
+
+void handleInt21(CPU& cpu, Memory& mem, IOCapture& io, EmulatorResult& result, VRAMState& vram) {
     static const int MAX_OUTPUT = 4096;
     uint8_t ah = cpu.getReg8(4); // AH
     switch (ah) {
@@ -3170,12 +3494,15 @@ void handleInt21(CPU& cpu, Memory& mem, IOCapture& io, EmulatorResult& result) {
             cpu.setReg8(0, (uint8_t)ch); // AL
             if ((int)io.stdoutBuf.size() < MAX_OUTPUT)
                 io.stdoutBuf += (char)ch;
+            ttyCharToVRAM(mem, vram, (uint8_t)ch);
             break;
         }
         case 0x02: { // Write DL to stdout
+            uint8_t dl = cpu.getReg8(2);
             if ((int)io.stdoutBuf.size() < MAX_OUTPUT) {
-                io.stdoutBuf += (char)cpu.getReg8(2); // DL
+                io.stdoutBuf += (char)dl; 
             }
+            ttyCharToVRAM(mem, vram, dl);
             break;
         }
         case 0x06: { // Direct console I/O
@@ -3187,14 +3514,16 @@ void handleInt21(CPU& cpu, Memory& mem, IOCapture& io, EmulatorResult& result) {
             } else {
                 if ((int)io.stdoutBuf.size() < MAX_OUTPUT)
                     io.stdoutBuf += (char)dl;
+                ttyCharToVRAM(mem, vram, dl);
             }
             break;
         }
         case 0x09: { // Write $-terminated string from DS:DX
-            uint16_t addr = cpu.regs[2]; // DX
+            uint16_t seg = cpu.sregs[3];  // DS
+            uint16_t off = cpu.regs[2];   // DX
             bool truncated = false;
             for (int i = 0; i < 65536; i++) {
-                uint8_t ch = mem.read8((uint16_t)(addr + i));
+                uint8_t ch = mem.sread8(seg, (uint16_t)(off + i));
                 if (ch == '$') break;
                 if ((int)io.stdoutBuf.size() < MAX_OUTPUT) {
                     io.stdoutBuf += (char)ch;
@@ -3202,9 +3531,10 @@ void handleInt21(CPU& cpu, Memory& mem, IOCapture& io, EmulatorResult& result) {
                     truncated = true;
                     result.diagnostics.push_back(
                         "Output truncated at " + to_string(MAX_OUTPUT) +
-                        " bytes (no '$' terminator found — possible bad pointer in DX=" +
-                        hexImm16(addr) + ")");
+                        " bytes (no '$' terminator found - possible bad pointer in DX=" +
+                        hexImm16(off) + ")");
                 }
+                ttyCharToVRAM(mem, vram, ch);
             }
             break;
         }
@@ -3241,13 +3571,15 @@ void handleInt21(CPU& cpu, Memory& mem, IOCapture& io, EmulatorResult& result) {
     }
 }
 
-void handleInterrupt(CPU& cpu, Memory& mem, IOCapture& io, EmulatorResult& result, uint8_t intNum) {
+void handleInterrupt(CPU& cpu, Memory& mem, IOCapture& io, EmulatorResult& result, uint8_t intNum, VRAMState& vram) {
     if (intNum == 0x20) {
         result.halted = true;
         result.haltReason = "INT 20h program terminate";
         result.exitCode = 0;
     } else if (intNum == 0x21) {
-        handleInt21(cpu, mem, io, result);
+        handleInt21(cpu, mem, io, result, vram);
+    } else if (intNum == 0x10) {
+        handleInt10(cpu, mem, vram, result);
     } else {
         result.skipped.push_back({ cpu.ip, "INT " + hexByte(intNum), "Unimplemented interrupt", 1 });
     }
@@ -3256,14 +3588,14 @@ void handleInterrupt(CPU& cpu, Memory& mem, IOCapture& io, EmulatorResult& resul
 // --- Section 4: Instruction Execution ---
 
 void executeInstruction(CPU& cpu, Memory& mem, IOCapture& io, const DecodedInst& inst,
-                        EmulatorResult& result, vector<uint8_t>& code, bool& memDirty) {
+                        EmulatorResult& result, vector<uint8_t>& code, bool& memDirty, VRAMState& vram) {
     const string& mn = inst.mnemonic;
 
     // --- ALU: ADD, ADC, SUB, SBB, CMP, AND, OR, XOR, TEST ---
     if (mn == "ADD" || mn == "ADC" || mn == "SUB" || mn == "SBB" ||
         mn == "CMP" || mn == "AND" || mn == "OR"  || mn == "XOR" || mn == "TEST") {
-        uint16_t a = readOperand(cpu, mem, inst.op1);
-        uint16_t b = readOperand(cpu, mem, inst.op2);
+        uint16_t a = readOperand(cpu, mem, inst.op1, inst.segOverride);
+        uint16_t b = readOperand(cpu, mem, inst.op2, inst.segOverride);
         bool wide = inst.wide;
         uint32_t mask = wide ? 0xFFFF : 0xFF;
         uint32_t res;
@@ -3271,36 +3603,36 @@ void executeInstruction(CPU& cpu, Memory& mem, IOCapture& io, const DecodedInst&
         if (mn == "ADD") {
             res = (uint32_t)a + b;
             updateFlagsAdd(cpu, res, a, b, wide);
-            writeOperand(cpu, mem, inst.op1, (uint16_t)(res & mask), memDirty);
+            writeOperand(cpu, mem, inst.op1, (uint16_t)(res & mask), memDirty, inst.segOverride);
         } else if (mn == "ADC") {
             uint16_t cf = cpu.getFlag(CPU::CF) ? 1 : 0;
             res = (uint32_t)a + b + cf;
             updateFlagsAdd(cpu, res, a, (uint16_t)(b + cf), wide);
-            writeOperand(cpu, mem, inst.op1, (uint16_t)(res & mask), memDirty);
+            writeOperand(cpu, mem, inst.op1, (uint16_t)(res & mask), memDirty, inst.segOverride);
         } else if (mn == "SUB") {
             res = (uint32_t)a - b;
             updateFlagsSub(cpu, res, a, b, wide);
-            writeOperand(cpu, mem, inst.op1, (uint16_t)(res & mask), memDirty);
+            writeOperand(cpu, mem, inst.op1, (uint16_t)(res & mask), memDirty, inst.segOverride);
         } else if (mn == "SBB") {
             uint16_t cf = cpu.getFlag(CPU::CF) ? 1 : 0;
             res = (uint32_t)a - b - cf;
             updateFlagsSub(cpu, res, a, (uint16_t)(b + cf), wide);
-            writeOperand(cpu, mem, inst.op1, (uint16_t)(res & mask), memDirty);
+            writeOperand(cpu, mem, inst.op1, (uint16_t)(res & mask), memDirty, inst.segOverride);
         } else if (mn == "CMP") {
             res = (uint32_t)a - b;
             updateFlagsSub(cpu, res, a, b, wide);
         } else if (mn == "AND") {
             res = a & b;
             updateFlagsLogic(cpu, (uint16_t)res, wide);
-            writeOperand(cpu, mem, inst.op1, (uint16_t)(res & mask), memDirty);
+            writeOperand(cpu, mem, inst.op1, (uint16_t)(res & mask), memDirty, inst.segOverride);
         } else if (mn == "OR") {
             res = a | b;
             updateFlagsLogic(cpu, (uint16_t)res, wide);
-            writeOperand(cpu, mem, inst.op1, (uint16_t)(res & mask), memDirty);
+            writeOperand(cpu, mem, inst.op1, (uint16_t)(res & mask), memDirty, inst.segOverride);
         } else if (mn == "XOR") {
             res = a ^ b;
             updateFlagsLogic(cpu, (uint16_t)res, wide);
-            writeOperand(cpu, mem, inst.op1, (uint16_t)(res & mask), memDirty);
+            writeOperand(cpu, mem, inst.op1, (uint16_t)(res & mask), memDirty, inst.segOverride);
         } else { // TEST
             res = a & b;
             updateFlagsLogic(cpu, (uint16_t)res, wide);
@@ -3309,43 +3641,43 @@ void executeInstruction(CPU& cpu, Memory& mem, IOCapture& io, const DecodedInst&
 
     // --- INC / DEC (preserve CF) ---
     else if (mn == "INC" || mn == "DEC") {
-        uint16_t val = readOperand(cpu, mem, inst.op1);
+        uint16_t val = readOperand(cpu, mem, inst.op1, inst.segOverride);
         bool wide = inst.wide;
         uint32_t mask = wide ? 0xFFFF : 0xFF;
         bool savedCF = cpu.getFlag(CPU::CF);
         if (mn == "INC") {
             uint32_t res = (uint32_t)val + 1;
             updateFlagsAdd(cpu, res, val, 1, wide);
-            writeOperand(cpu, mem, inst.op1, (uint16_t)(res & mask), memDirty);
+            writeOperand(cpu, mem, inst.op1, (uint16_t)(res & mask), memDirty, inst.segOverride);
         } else {
             uint32_t res = (uint32_t)val - 1;
             updateFlagsSub(cpu, res, val, 1, wide);
-            writeOperand(cpu, mem, inst.op1, (uint16_t)(res & mask), memDirty);
+            writeOperand(cpu, mem, inst.op1, (uint16_t)(res & mask), memDirty, inst.segOverride);
         }
         cpu.setFlag(CPU::CF, savedCF); // preserve CF
     }
 
     // --- NOT ---
     else if (mn == "NOT") {
-        uint16_t val = readOperand(cpu, mem, inst.op1);
+        uint16_t val = readOperand(cpu, mem, inst.op1, inst.segOverride);
         uint32_t mask = inst.wide ? 0xFFFF : 0xFF;
-        writeOperand(cpu, mem, inst.op1, (uint16_t)(~val & mask), memDirty);
+        writeOperand(cpu, mem, inst.op1, (uint16_t)(~val & mask), memDirty, inst.segOverride);
     }
 
     // --- NEG ---
     else if (mn == "NEG") {
-        uint16_t val = readOperand(cpu, mem, inst.op1);
+        uint16_t val = readOperand(cpu, mem, inst.op1, inst.segOverride);
         bool wide = inst.wide;
         uint32_t mask = wide ? 0xFFFF : 0xFF;
         uint32_t res = (uint32_t)(0 - val);
         updateFlagsSub(cpu, res, 0, val, wide);
         cpu.setFlag(CPU::CF, val != 0);
-        writeOperand(cpu, mem, inst.op1, (uint16_t)(res & mask), memDirty);
+        writeOperand(cpu, mem, inst.op1, (uint16_t)(res & mask), memDirty, inst.segOverride);
     }
 
     // --- MUL ---
     else if (mn == "MUL") {
-        uint16_t val = readOperand(cpu, mem, inst.op1);
+        uint16_t val = readOperand(cpu, mem, inst.op1, inst.segOverride);
         if (inst.wide) {
             uint32_t res = (uint32_t)cpu.regs[0] * val;
             cpu.regs[0] = (uint16_t)(res & 0xFFFF);
@@ -3364,7 +3696,7 @@ void executeInstruction(CPU& cpu, Memory& mem, IOCapture& io, const DecodedInst&
 
     // --- IMUL ---
     else if (mn == "IMUL") {
-        uint16_t val = readOperand(cpu, mem, inst.op1);
+        uint16_t val = readOperand(cpu, mem, inst.op1, inst.segOverride);
         if (inst.wide) {
             int32_t res = (int32_t)(int16_t)cpu.regs[0] * (int32_t)(int16_t)val;
             cpu.regs[0] = (uint16_t)(res & 0xFFFF);
@@ -3385,7 +3717,7 @@ void executeInstruction(CPU& cpu, Memory& mem, IOCapture& io, const DecodedInst&
 
     // --- DIV ---
     else if (mn == "DIV") {
-        uint16_t val = readOperand(cpu, mem, inst.op1);
+        uint16_t val = readOperand(cpu, mem, inst.op1, inst.segOverride);
         if (val == 0) {
             result.halted = true;
             result.haltReason = "Division by zero";
@@ -3419,7 +3751,7 @@ void executeInstruction(CPU& cpu, Memory& mem, IOCapture& io, const DecodedInst&
 
     // --- IDIV ---
     else if (mn == "IDIV") {
-        uint16_t val = readOperand(cpu, mem, inst.op1);
+        uint16_t val = readOperand(cpu, mem, inst.op1, inst.segOverride);
         if (val == 0) {
             result.halted = true;
             result.haltReason = "Division by zero";
@@ -3455,8 +3787,8 @@ void executeInstruction(CPU& cpu, Memory& mem, IOCapture& io, const DecodedInst&
     // --- Shifts and Rotates ---
     else if (mn == "SHL" || mn == "SHR" || mn == "SAR" ||
              mn == "ROL" || mn == "ROR" || mn == "RCL" || mn == "RCR") {
-        uint16_t val = readOperand(cpu, mem, inst.op1);
-        uint16_t cnt = readOperand(cpu, mem, inst.op2) & 0x1F; // mask to 0-31
+        uint16_t val = readOperand(cpu, mem, inst.op1, inst.segOverride);
+        uint16_t cnt = readOperand(cpu, mem, inst.op2, inst.segOverride) & 0x1F; // mask to 0-31
         if (cnt == 0) return; // no operation, no flag changes
         bool wide = inst.wide;
         uint32_t mask = wide ? 0xFFFF : 0xFF;
@@ -3524,21 +3856,21 @@ void executeInstruction(CPU& cpu, Memory& mem, IOCapture& io, const DecodedInst&
             }
             if (cnt == 1) cpu.setFlag(CPU::OF, (bool)(res & signBit) != (bool)(res & (signBit >> 1)));
         }
-        writeOperand(cpu, mem, inst.op1, (uint16_t)(res & mask), memDirty);
+        writeOperand(cpu, mem, inst.op1, (uint16_t)(res & mask), memDirty, inst.segOverride);
     }
 
     // --- MOV ---
     else if (mn == "MOV") {
-        uint16_t val = readOperand(cpu, mem, inst.op2);
-        writeOperand(cpu, mem, inst.op1, val, memDirty);
+        uint16_t val = readOperand(cpu, mem, inst.op2, inst.segOverride);
+        writeOperand(cpu, mem, inst.op1, val, memDirty, inst.segOverride);
     }
 
     // --- XCHG ---
     else if (mn == "XCHG") {
-        uint16_t a = readOperand(cpu, mem, inst.op1);
-        uint16_t b = readOperand(cpu, mem, inst.op2);
-        writeOperand(cpu, mem, inst.op1, b, memDirty);
-        writeOperand(cpu, mem, inst.op2, a, memDirty);
+        uint16_t a = readOperand(cpu, mem, inst.op1, inst.segOverride);
+        uint16_t b = readOperand(cpu, mem, inst.op2, inst.segOverride);
+        writeOperand(cpu, mem, inst.op1, b, memDirty, inst.segOverride);
+        writeOperand(cpu, mem, inst.op2, a, memDirty, inst.segOverride);
     }
 
     // --- LEA ---
@@ -3549,7 +3881,7 @@ void executeInstruction(CPU& cpu, Memory& mem, IOCapture& io, const DecodedInst&
 
     // --- PUSH ---
     else if (mn == "PUSH") {
-        uint16_t val = readOperand(cpu, mem, inst.op1);
+        uint16_t val = readOperand(cpu, mem, inst.op1, inst.segOverride);
         cpu.regs[4] -= 2;  // SP -= 2
         mem.write16(cpu.regs[4], val);
         memDirty = true;
@@ -3559,7 +3891,7 @@ void executeInstruction(CPU& cpu, Memory& mem, IOCapture& io, const DecodedInst&
     else if (mn == "POP") {
         uint16_t val = mem.read16(cpu.regs[4]);
         cpu.regs[4] += 2;  // SP += 2
-        writeOperand(cpu, mem, inst.op1, val, memDirty);
+        writeOperand(cpu, mem, inst.op1, val, memDirty, inst.segOverride);
     }
 
     // --- JMP ---
@@ -3568,7 +3900,7 @@ void executeInstruction(CPU& cpu, Memory& mem, IOCapture& io, const DecodedInst&
             cpu.ip = (uint16_t)inst.jumpTarget;
         } else {
             // Indirect JMP through register/memory (FF /4)
-            uint16_t target = readOperand(cpu, mem, inst.op1);
+            uint16_t target = readOperand(cpu, mem, inst.op1, inst.segOverride);
             cpu.ip = target;
         }
     }
@@ -3582,7 +3914,7 @@ void executeInstruction(CPU& cpu, Memory& mem, IOCapture& io, const DecodedInst&
         if (inst.jumpTarget >= 0) {
             cpu.ip = (uint16_t)inst.jumpTarget;
         } else {
-            uint16_t target = readOperand(cpu, mem, inst.op1);
+            uint16_t target = readOperand(cpu, mem, inst.op1, inst.segOverride);
             cpu.ip = target;
         }
     }
@@ -3625,30 +3957,35 @@ void executeInstruction(CPU& cpu, Memory& mem, IOCapture& io, const DecodedInst&
         bool isCompare = (mn.substr(0, 4) == "CMPS" || mn.substr(0, 4) == "SCAS");
 
         auto doOne = [&]() {
+            // Source segment: DS by default, overridable by prefix
+            uint16_t srcSeg = resolveSegment(cpu, inst.op1, inst.segOverride);
+            // Destination segment: always ES, never overridable
+            uint16_t dstSeg = cpu.sregs[0];  // ES
+
             if (mn.substr(0, 4) == "MOVS") {
-                if (isWord) mem.write16(cpu.regs[7], mem.read16(cpu.regs[6]));
-                else mem.write8(cpu.regs[7], mem.read8(cpu.regs[6]));
+                if (isWord) mem.swrite16(dstSeg, cpu.regs[7], mem.sread16(srcSeg, cpu.regs[6]));
+                else        mem.swrite8(dstSeg, cpu.regs[7], mem.sread8(srcSeg, cpu.regs[6]));
                 cpu.regs[6] += dir; cpu.regs[7] += dir;
                 memDirty = true;
             } else if (mn.substr(0, 4) == "CMPS") {
                 uint16_t a, b;
-                if (isWord) { a = mem.read16(cpu.regs[6]); b = mem.read16(cpu.regs[7]); }
-                else { a = mem.read8(cpu.regs[6]); b = mem.read8(cpu.regs[7]); }
+                if (isWord) { a = mem.sread16(srcSeg, cpu.regs[6]); b = mem.sread16(dstSeg, cpu.regs[7]); }
+                else        { a = mem.sread8(srcSeg, cpu.regs[6]);   b = mem.sread8(dstSeg, cpu.regs[7]); }
                 updateFlagsSub(cpu, (uint32_t)a - b, a, b, isWord);
                 cpu.regs[6] += dir; cpu.regs[7] += dir;
             } else if (mn.substr(0, 4) == "STOS") {
-                if (isWord) mem.write16(cpu.regs[7], cpu.regs[0]);
-                else mem.write8(cpu.regs[7], cpu.getReg8(0));
+                if (isWord) mem.swrite16(dstSeg, cpu.regs[7], cpu.regs[0]);
+                else        mem.swrite8(dstSeg, cpu.regs[7], cpu.getReg8(0));
                 cpu.regs[7] += dir;
                 memDirty = true;
             } else if (mn.substr(0, 4) == "LODS") {
-                if (isWord) cpu.regs[0] = mem.read16(cpu.regs[6]);
-                else cpu.setReg8(0, mem.read8(cpu.regs[6]));
+                if (isWord) cpu.regs[0] = mem.sread16(srcSeg, cpu.regs[6]);
+                else        cpu.setReg8(0, mem.sread8(srcSeg, cpu.regs[6]));
                 cpu.regs[6] += dir;
             } else if (mn.substr(0, 4) == "SCAS") {
                 uint16_t a, b;
-                if (isWord) { a = cpu.regs[0]; b = mem.read16(cpu.regs[7]); }
-                else { a = cpu.getReg8(0); b = mem.read8(cpu.regs[7]); }
+                if (isWord) { a = cpu.regs[0]; b = mem.sread16(dstSeg, cpu.regs[7]); }
+                else        { a = cpu.getReg8(0); b = mem.sread8(dstSeg, cpu.regs[7]); }
                 updateFlagsSub(cpu, (uint32_t)a - b, a, b, isWord);
                 cpu.regs[7] += dir;
             }
@@ -3707,7 +4044,8 @@ void executeInstruction(CPU& cpu, Memory& mem, IOCapture& io, const DecodedInst&
     // --- XLAT ---
     else if (mn == "XLAT") {
         uint16_t addr = (uint16_t)(cpu.regs[3] + cpu.getReg8(0)); // BX + AL
-        cpu.setReg8(0, mem.read8(addr));
+        // XLAT uses DS:BX+AL
+        cpu.setReg8(0, mem.sread8(cpu.sregs[3], addr));
     }
 
     // --- HLT ---
@@ -3745,7 +4083,7 @@ void executeInstruction(CPU& cpu, Memory& mem, IOCapture& io, const DecodedInst&
     // --- INT ---
     else if (mn == "INT") {
         uint8_t intNum = (uint8_t)(inst.op1.disp & 0xFF);
-        handleInterrupt(cpu, mem, io, result, intNum);
+        handleInterrupt(cpu, mem, io, result, intNum, vram);
     }
 
     // --- IN / OUT ---
@@ -3761,51 +4099,108 @@ void executeInstruction(CPU& cpu, Memory& mem, IOCapture& io, const DecodedInst&
 
 // --- Section 6: Breakpoints & Watchpoints ---
 
-void captureSnapshot(const CPU& cpu, const Memory& mem, const vector<uint8_t>& code,
-                     int cycle, const string& reason, const EmulatorConfig& config,
+// Replaces dumpVRAMViewport
+void captureViewport(const Memory& mem, const EmulatorConfig& config,
+                     vector<string>& textOut, vector<string>& attrOut) {
+    if (!config.hasViewport) return;
+
+    // Viewport dimensions (clamped to 80x50 screen)
+    int startRow = config.vpRow;
+    int startCol = config.vpCol;
+    int rows = config.vpHeight;
+    int cols = config.vpWidth;
+
+    for (int r = 0; r < rows; r++) {
+        int screenRow = startRow + r;
+        if (screenRow >= 50) break;
+
+        string textLine;
+        string attrLine;
+        textLine.reserve(cols);
+
+        for (int c = 0; c < cols; c++) {
+            int screenCol = startCol + c;
+            if (screenCol >= 80) break;
+
+            int off = (screenRow * 80 + screenCol) * 2;
+            uint8_t ch = mem.vram[off];
+            uint8_t at = mem.vram[off + 1];
+
+            // Replace non-printable with '.' for clean JSON
+            textLine += (ch >= 0x20 && ch < 0x7F) ? (char)ch : '.';
+
+            if (config.vpAttrs) {
+                char hex[3];
+                snprintf(hex, sizeof(hex), "%02X", at);
+                attrLine += hex;
+            }
+        }
+
+        textOut.push_back(textLine);
+        if (config.vpAttrs) attrOut.push_back(attrLine);
+    }
+}
+
+void captureSnapshot(const CPU& cpu, const Memory& mem,
+                     const vector<uint8_t>& code,
+                     int cycle, const string& reason,
+                     const EmulatorConfig& config,
+                     const VRAMState& vram,
                      vector<Snapshot>& snapshots) {
     Snapshot snap;
+    // Limit snapshots to prevent massive output loops
+    if (snapshots.size() >= 100) return;
+
     snap.addr = cpu.ip;
     snap.cycle = cycle;
-    for (int i = 0; i < 8; i++) snap.regs[i] = cpu.regs[i];
-    for (int i = 0; i < 4; i++) snap.sregs[i] = cpu.sregs[i];
+    for(int i=0; i<8; i++) snap.regs[i] = cpu.regs[i];
+    for(int i=0; i<4; i++) snap.sregs[i] = cpu.sregs[i];
     snap.ip = cpu.ip;
     snap.flags = cpu.flags;
     snap.reason = reason;
+    snap.snapCursorRow = vram.cursorRow;
+    snap.snapCursorCol = vram.cursorCol;
 
-    // Next instruction disassembly
-    DecodedInst nextInst = decodeInstruction(code, cpu.ip);
-    if (nextInst.valid) snap.nextInst = formatInstruction(nextInst);
+    // Decode next instruction for context
+    DecodedInst inst = decodeInstruction(code, cpu.ip);
+    if (inst.valid) snap.nextInst = formatInstruction(inst);
     else snap.nextInst = "???";
 
-    // Stack top 8 words
-    for (int i = 0; i < 8; i++) {
-        uint16_t addr = cpu.regs[4] + (uint16_t)(i * 2);
-        snap.stack.push_back(mem.read16(addr));
+    // Capture stack (top 8 words, SS-relative)
+    uint16_t sp = cpu.regs[4];
+    uint16_t ss = cpu.sregs[2];
+    for (int i=0; i<8; i++) {
+        snap.stack.push_back(mem.sread16(ss, (uint16_t)(sp + i*2)));
     }
 
     // Optional memory dump
     if (config.memDumpLen > 0) {
-        for (int i = 0; i < config.memDumpLen; i++) {
-            snap.memDump.push_back(mem.read8((uint16_t)(config.memDumpAddr + i)));
+        for(int i=0; i<config.memDumpLen; i++) {
+             snap.memDump.push_back(mem.read8((uint16_t)(config.memDumpAddr + i)));
         }
+    }
+
+    // Optional viewport capture
+    if (config.hasViewport) {
+        captureViewport(mem, config, snap.screenLines, snap.screenAttrs);
     }
 
     snapshots.push_back(snap);
 }
 
 void checkBreakpoints(const CPU& cpu, const Memory& mem, const vector<uint8_t>& code,
-                      EmulatorResult& result, const EmulatorConfig& config, int cycle) {
+                      EmulatorResult& result, const EmulatorConfig& config, int cycle,
+                      const VRAMState& vram) {
     if (config.breakpoints.count(cpu.ip)) {
-        // Hit limiting: full snapshot for first 10 hits, then just count
-        int hitCount = 0;
+        // Hit limiting: full snapshot for first 10 hits per address, then just count
+        int hits = 0;
         for (auto& s : result.snapshots) {
-            if (s.addr == cpu.ip && s.reason.find("Breakpoint") != string::npos) hitCount++;
+            if (s.addr == cpu.ip && s.reason.find("Breakpoint") != string::npos) hits++;
         }
-        if (hitCount < 10) {
-            captureSnapshot(cpu, mem, code, cycle, "Breakpoint at " + hexImm16(cpu.ip), config, result.snapshots);
-        } else if (hitCount == 10) {
-            // Just increment the last one
+        if (hits < 10) {
+            captureSnapshot(cpu, mem, code, cycle, "Breakpoint at " + hexImm16(cpu.ip), config, vram, result.snapshots);
+        } else {
+            // Just increment the last matching snapshot's hitCount
             for (int i = (int)result.snapshots.size() - 1; i >= 0; i--) {
                 if (result.snapshots[i].addr == cpu.ip) {
                     result.snapshots[i].hitCount++;
@@ -3816,20 +4211,16 @@ void checkBreakpoints(const CPU& cpu, const Memory& mem, const vector<uint8_t>& 
     }
 }
 
-void checkWatchpoints(const CPU& cpu, const uint16_t prevRegs[8], const EmulatorConfig& config,
+// Check watchpoints: any register change
+void checkWatchpoints(const CPU& cpu, uint16_t prevRegs[8], const EmulatorConfig& config,
                       const Memory& mem, const vector<uint8_t>& code,
-                      EmulatorResult& result, int cycle) {
-    for (int r : config.watchRegs) {
-        if (r >= 0 && r < 8 && cpu.regs[r] != prevRegs[r]) {
-            string reason = getRegName(r, 16) + " changed: " + hexImm16(prevRegs[r]) + " -> " + hexImm16(cpu.regs[r]);
-            // Hit limiting
-            int hitCount = 0;
-            for (auto& s : result.snapshots) {
-                if (s.reason.find(getRegName(r, 16) + " changed") != string::npos) hitCount++;
-            }
-            if (hitCount < 10) {
-                captureSnapshot(cpu, mem, code, cycle, reason, config, result.snapshots);
-            }
+                      EmulatorResult& result, int cycle, const VRAMState& vram) {
+    for (int regIdx : config.watchRegs) {
+        if (cpu.regs[regIdx] != prevRegs[regIdx]) {
+             string regName = getRegName(regIdx, 16);
+             string msg = "Watchpoint: " + regName + " changed from " +
+                          hexImm16(prevRegs[regIdx]) + " to " + hexImm16(cpu.regs[regIdx]);
+             captureSnapshot(cpu, mem, code, cycle, msg, config, vram, result.snapshots);
         }
     }
 }
@@ -3844,10 +4235,14 @@ double computeFidelity(const EmulatorResult& result) {
     return ratio < 0 ? 0 : ratio;
 }
 
+void captureViewport(const Memory& mem, const EmulatorConfig& config,
+                     vector<string>& textOut, vector<string>& attrOut); // Moved up
+
 EmulatorResult runEmulator(const vector<uint8_t>& binary, const EmulatorConfig& config, CPU& cpuOut) {
     EmulatorResult result;
     CPU cpu;
     Memory mem;
+    VRAMState vram;
     IOCapture io;
     io.stdinSource = config.stdinInput;
 
@@ -3856,6 +4251,9 @@ EmulatorResult runEmulator(const vector<uint8_t>& binary, const EmulatorConfig& 
     cpu.regs[4] = 0xFFFE;  // SP
     cpu.flags = 0x0202;     // IF set
     cpu.sregs[3] = 0;       // DS = 0
+
+    // Init VRAM
+    vram.clearScreen(mem);
 
     // Load binary and PSP INT 20h
     mem.loadCOM(binary);
@@ -3869,14 +4267,19 @@ EmulatorResult runEmulator(const vector<uint8_t>& binary, const EmulatorConfig& 
     int cycle = 0;
     while (cycle < config.maxCycles) {
         // Resync code on self-modifying writes
-        if (memDirty) {
-            code.assign(mem.data, mem.data + 65536);
-            memDirty = false;
+        if (memDirty && config.memDumpLen > 0) {
+            // Re-capture if memory dump region changed?
+            // This is expensive to check every cycle.
+            // Simplified: we only capture on breakpoints/watchpoints instructions.
         }
+
+        // Save previous register state for watchpoints
+        uint16_t prevRegs[8];
+        for (int i = 0; i < 8; i++) prevRegs[i] = cpu.regs[i];
 
         // Check breakpoints
         if (!config.breakpoints.empty()) {
-            checkBreakpoints(cpu, mem, code, result, config, cycle);
+            checkBreakpoints(cpu, mem, code, result, config, cycle, vram);
         }
 
         // Decode
@@ -3887,22 +4290,18 @@ EmulatorResult runEmulator(const vector<uint8_t>& binary, const EmulatorConfig& 
             break;
         }
 
-        // Save previous register state for watchpoints
-        uint16_t prevRegs[8];
-        for (int i = 0; i < 8; i++) prevRegs[i] = cpu.regs[i];
-
         // Advance IP before execution (branches will overwrite)
         cpu.ip = (uint16_t)(cpu.ip + inst.size);
 
         // Execute
-        executeInstruction(cpu, mem, io, inst, result, code, memDirty);
+        executeInstruction(cpu, mem, io, inst, result, code, memDirty, vram);
         cycle++;
 
         if (result.halted) break;
 
         // Check watchpoints
         if (!config.watchRegs.empty()) {
-            checkWatchpoints(cpu, prevRegs, config, mem, code, result, cycle);
+            checkWatchpoints(cpu, prevRegs, config, mem, code, result, cycle, vram);
         }
     }
 
@@ -3915,6 +4314,12 @@ EmulatorResult runEmulator(const vector<uint8_t>& binary, const EmulatorConfig& 
     result.cyclesExecuted = cycle;
     result.output = io.stdoutBuf;
     result.fidelity = computeFidelity(result);
+    // Capture viewport if requested
+    if (config.hasViewport) {
+        captureViewport(mem, config, result.screen, result.screenAttrs);
+    }
+    result.cursorRow = vram.cursorRow;
+    result.cursorCol = vram.cursorCol;
     cpuOut = cpu;
     return result;
 }
@@ -3965,7 +4370,9 @@ void emitEmulatorJSON(const EmulatorResult& result, const CPU& cpu) {
     cout << "\"OF\": " << cpu.getFlag(CPU::OF) << ", ";
     cout << "\"DF\": " << cpu.getFlag(CPU::DF) << ", ";
     cout << "\"IF\": " << cpu.getFlag(CPU::IF_);
-    cout << "}" << endl;
+    cout << "}" << "," << endl;
+    cout << "    \"cursor\": {\"row\": " << result.cursorRow
+         << ", \"col\": " << result.cursorCol << "}" << endl;
     cout << "  }," << endl;
 
     // Snapshots
@@ -3985,6 +4392,8 @@ void emitEmulatorJSON(const EmulatorResult& result, const CPU& cpu) {
         }
         cout << "}," << endl;
         cout << "      \"flags\": \"" << hexImm16(s.flags) << "\"," << endl;
+        cout << "      \"cursor\": {\"row\": " << s.snapCursorRow
+             << ", \"col\": " << s.snapCursorCol << "}," << endl;
         cout << "      \"stack\": [";
         for (size_t k = 0; k < s.stack.size(); k++) {
             cout << "\"" << hexImm16(s.stack[k]) << "\"";
@@ -3995,6 +4404,22 @@ void emitEmulatorJSON(const EmulatorResult& result, const CPU& cpu) {
             cout << "," << endl << "      \"memDump\": \"";
             for (auto b : s.memDump) cout << hexByte(b);
             cout << "\"";
+        }
+        if (!s.screenLines.empty()) {
+            cout << "," << endl << "      \"screen\": [";
+            for (size_t k = 0; k < s.screenLines.size(); k++) {
+                cout << "\"" << jsonEscape(s.screenLines[k]) << "\"";
+                if (k < s.screenLines.size() - 1) cout << ", ";
+            }
+            cout << "]";
+            if (!s.screenAttrs.empty()) {
+                cout << "," << endl << "      \"screenAttrs\": [";
+                for (size_t k = 0; k < s.screenAttrs.size(); k++) {
+                    cout << "\"" << s.screenAttrs[k] << "\"";
+                    if (k < s.screenAttrs.size() - 1) cout << ", ";
+                }
+                cout << "]";
+            }
         }
         cout << endl << "    }";
         if (i < result.snapshots.size() - 1) cout << ",";
@@ -4020,8 +4445,31 @@ void emitEmulatorJSON(const EmulatorResult& result, const CPU& cpu) {
         if (i < result.diagnostics.size() - 1) cout << ",";
         cout << endl;
     }
-    cout << "  ]" << endl;
-    cout << "}" << endl;
+    cout << "  ]";
+
+    // Screen (conditional)
+    if (!result.screen.empty()) {
+        cout << "," << endl; 
+        cout << "  \"screen\": [" << endl;
+        for (size_t i = 0; i < result.screen.size(); i++) {
+            cout << "    \"" << jsonEscape(result.screen[i]) << "\"";
+            if (i < result.screen.size() - 1) cout << ",";
+            cout << endl;
+        }
+        cout << "  ]";
+
+        if (!result.screenAttrs.empty()) {
+            cout << "," << endl;
+            cout << "  \"screenAttrs\": [" << endl;
+            for (size_t i = 0; i < result.screenAttrs.size(); i++) {
+                cout << "    \"" << jsonEscape(result.screenAttrs[i]) << "\"";
+                if (i < result.screenAttrs.size() - 1) cout << ",";
+                cout << endl;
+            }
+            cout << "  ]" << endl;
+        }
+    }
+    cout << endl << "}" << endl;
 }
 
 void emitCombinedJSON(AssemblerContext& asmCtx, const EmulatorResult& emuResult, const CPU& cpu) {
@@ -4072,7 +4520,9 @@ void emitCombinedJSON(AssemblerContext& asmCtx, const EmulatorResult& emuResult,
     }
     cout << "}," << endl;
     cout << "      \"IP\": \"" << hexImm16(cpu.ip) << "\"," << endl;
-    cout << "      \"flags\": \"" << hexImm16(cpu.flags) << "\"" << endl;
+    cout << "      \"flags\": \"" << hexImm16(cpu.flags) << "\"," << endl;
+    cout << "      \"cursor\": {\"row\": " << emuResult.cursorRow
+         << ", \"col\": " << emuResult.cursorCol << "}" << endl;
     cout << "    }," << endl;
 
     // Skipped
@@ -4084,6 +4534,28 @@ void emitCombinedJSON(AssemblerContext& asmCtx, const EmulatorResult& emuResult,
     }
     cout << "]" << endl;
 
+    // Screen (for Combined JSON)
+    if (!emuResult.screen.empty()) {
+        cout << "," << endl;
+        cout << "    \"screen\": [" << endl;
+        for (size_t i = 0; i < emuResult.screen.size(); i++) {
+            cout << "      \"" << jsonEscape(emuResult.screen[i]) << "\"";
+            if (i < emuResult.screen.size() - 1) cout << ",";
+            cout << endl;
+        }
+        cout << "    ]";
+
+        if (!emuResult.screenAttrs.empty()) {
+            cout << "," << endl;
+            cout << "    \"screenAttrs\": [" << endl;
+            for (size_t i = 0; i < emuResult.screenAttrs.size(); i++) {
+                cout << "      \"" << jsonEscape(emuResult.screenAttrs[i]) << "\"";
+                if (i < emuResult.screenAttrs.size() - 1) cout << ",";
+                cout << endl;
+            }
+            cout << "    ]" << endl;
+        }
+    }
     cout << "  }" << endl;
     cout << "}" << endl;
 }
@@ -4161,9 +4633,46 @@ int main(int argc, char* argv[]) {
                 emuConfig.memDumpAddr = (uint16_t)stoul(mdarg.substr(0, comma), nullptr, 16);
                 emuConfig.memDumpLen = stoi(mdarg.substr(comma + 1));
             }
+        } else if (arg == "--screen") {
+            // Full 80x50 screen capture
+            emuConfig.hasViewport = true;
+            emuConfig.vpCol = 0;
+            emuConfig.vpRow = 0;
+            emuConfig.vpWidth = 80;
+            emuConfig.vpHeight = 50;
+        } else if (arg == "--viewport" && i + 1 < argc) {
+            ++i;
+            // Format: col,row,width,height
+            int c = 0, r = 0, w = 80, h = 50;
+            if (sscanf(argv[i], "%d,%d,%d,%d", &c, &r, &w, &h) == 4) {
+                emuConfig.hasViewport = true;
+                emuConfig.vpCol = c;
+                emuConfig.vpRow = r;
+                emuConfig.vpWidth = w;
+                emuConfig.vpHeight = h;
+            } else {
+                cerr << "Invalid --viewport format. Use: col,row,width,height" << endl;
+                return 1;
+            }
+        } else if (arg == "--attrs") {
+            emuConfig.vpAttrs = true;
+        } else if (arg == "--output-file" && i + 1 < argc) {
+            ++i;
+            emuConfig.outputFile = argv[i];
         } else {
             filename = arg;
         }
+    }
+
+    // Redirect output to file if requested
+    ofstream outputFileStream;
+    if (!emuConfig.outputFile.empty()) {
+        outputFileStream.open(emuConfig.outputFile, ios::binary);
+        if (!outputFileStream) {
+            cerr << "Cannot open output file: " << emuConfig.outputFile << endl;
+            return 1;
+        }
+        cout.rdbuf(outputFileStream.rdbuf());
     }
 
     // --- Disassemble mode ---
@@ -4245,7 +4754,7 @@ int main(int argc, char* argv[]) {
              cout << "{ \"error\": \"No input file\" }" << endl;
              return 0;
         }
-        cerr << "Usage: assembler [--agent] source.asm" << endl;
+        cerr << "Usage: agent86 [--agent] source.asm" << endl;
         return 1;
     }
     string outfile = "output.com";
