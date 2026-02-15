@@ -472,7 +472,9 @@ If no file is provided:
 | Instruction | Forms | Notes |
 |---|---|---|
 | `ADD` | reg←reg, reg←mem, mem←reg, reg←imm, mem←imm | Affects CF, ZF, SF, OF |
+| `ADC` | reg←reg, reg←mem, mem←reg, reg←imm, mem←imm | Add with carry. Adds source + destination + CF. Used for multi-precision arithmetic. |
 | `SUB` | reg←reg, reg←mem, mem←reg, reg←imm, mem←imm | |
+| `SBB` | reg←reg, reg←mem, mem←reg, reg←imm, mem←imm | Subtract with borrow. Subtracts source + CF from destination. Used for multi-precision arithmetic. |
 | `CMP` | reg←reg, reg←mem, mem←reg, reg←imm, mem←imm | Like SUB but discards result, sets flags only |
 | `INC` | reg, mem | 16-bit regs use short-form encoding (1 byte). Preserves CF. |
 | `DEC` | reg, mem | Same as INC. Preserves CF. |
@@ -1097,6 +1099,25 @@ ENDP
 
 ```asm
     XOR AX, AX        ; AX = 0 (2 bytes, preferred over MOV AX, 0 which is 3 bytes)
+```
+
+### Multi-Precision Arithmetic
+
+```asm
+    ; 32-bit addition: DX:AX = DX:AX + CX:BX
+    ADD AX, BX        ; Add low words
+    ADC DX, CX        ; Add high words + carry from low addition
+
+    ; 32-bit subtraction: DX:AX = DX:AX - CX:BX
+    SUB AX, BX        ; Subtract low words
+    SBB DX, CX        ; Subtract high words - borrow from low subtraction
+
+    ; Example: Add 0x12345678 + 0x00001000
+    MOV DX, 1234h     ; DX:AX = 0x12345678
+    MOV AX, 5678h
+    ADD AX, 1000h     ; Add to low word
+    ADC DX, 0         ; Propagate carry to high word
+    ; Result: DX:AX = 0x12355678
 ```
 
 ### Conditional Branching

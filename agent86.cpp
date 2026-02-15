@@ -1268,13 +1268,15 @@ void assembleLine(AssemblerContext& ctx, const vector<Token>& tokens, int lineNu
         }
     }
     // 2. Arithmetic & Logic
-    else if (mnemonic == "ADD" || mnemonic == "SUB" || mnemonic == "CMP" || 
-             mnemonic == "AND" || mnemonic == "OR" || mnemonic == "XOR" || mnemonic == "TEST") {
+    else if (mnemonic == "ADD" || mnemonic == "ADC" || mnemonic == "SUB" || mnemonic == "SBB" ||
+             mnemonic == "CMP" || mnemonic == "AND" || mnemonic == "OR" || mnemonic == "XOR" || mnemonic == "TEST") {
         
         if (op1.type == Operand::REGISTER && op2.type == Operand::REGISTER) {
             uint8_t base = 0;
             if (mnemonic == "ADD") base = 0x00;
             else if (mnemonic == "OR")  base = 0x08;
+            else if (mnemonic == "ADC") base = 0x10;
+            else if (mnemonic == "SBB") base = 0x18;
             else if (mnemonic == "AND") base = 0x20;
             else if (mnemonic == "SUB") base = 0x28;
             else if (mnemonic == "XOR") base = 0x30;
@@ -1298,6 +1300,8 @@ void assembleLine(AssemblerContext& ctx, const vector<Token>& tokens, int lineNu
              int ext = 0;
              if (mnemonic == "ADD") ext = 0;
              else if (mnemonic == "OR")  ext = 1;
+             else if (mnemonic == "ADC") ext = 2;
+             else if (mnemonic == "SBB") ext = 3;
              else if (mnemonic == "AND") ext = 4;
              else if (mnemonic == "SUB") ext = 5;
              else if (mnemonic == "XOR") ext = 6;
@@ -1324,6 +1328,8 @@ void assembleLine(AssemblerContext& ctx, const vector<Token>& tokens, int lineNu
             uint8_t base = 0;
             if (mnemonic == "ADD") base = 0x02;
             else if (mnemonic == "OR")  base = 0x0A;
+            else if (mnemonic == "ADC") base = 0x12;
+            else if (mnemonic == "SBB") base = 0x1A;
             else if (mnemonic == "AND") base = 0x22;
             else if (mnemonic == "SUB") base = 0x2A;
             else if (mnemonic == "XOR") base = 0x32;
@@ -1340,6 +1346,8 @@ void assembleLine(AssemblerContext& ctx, const vector<Token>& tokens, int lineNu
             uint8_t base = 0;
             if (mnemonic == "ADD") base = 0x00;
             else if (mnemonic == "OR")  base = 0x08;
+            else if (mnemonic == "ADC") base = 0x10;
+            else if (mnemonic == "SBB") base = 0x18;
             else if (mnemonic == "AND") base = 0x20;
             else if (mnemonic == "SUB") base = 0x28;
             else if (mnemonic == "XOR") base = 0x30;
@@ -1370,6 +1378,8 @@ void assembleLine(AssemblerContext& ctx, const vector<Token>& tokens, int lineNu
                 int ext = 0;
                 if (mnemonic == "ADD") ext = 0;
                 else if (mnemonic == "OR")  ext = 1;
+                else if (mnemonic == "ADC") ext = 2;
+                else if (mnemonic == "SBB") ext = 3;
                 else if (mnemonic == "AND") ext = 4;
                 else if (mnemonic == "SUB") ext = 5;
                 else if (mnemonic == "XOR") ext = 6;
