@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cctype>
 #include <set>
+#include <filesystem>
 
 using namespace std;
 
@@ -88,6 +89,15 @@ struct AssemblerContext {
     bool globalError = false;
     bool encounteredSymbol = false; // NEW: Track if current expression involved a symbol
 };
+
+// --- Source Location Tracking (for INCLUDE directive) ---
+
+struct SourceLocation {
+    string file;  // path of source file
+    int line;     // 1-based line number within that file
+};
+
+static const int MAX_INCLUDE_DEPTH = 16;
 
 // --- Helper Functions ---
 
@@ -511,7 +521,7 @@ int parseExpression(AssemblerContext& ctx, const vector<Token>& tokens, int& idx
         lhs = parseNumber(tokens[idx].value, numOk, numReason);
         if (!numOk) logError(ctx, tokens[idx].line, "Invalid numeric literal: " + tokens[idx].value, numReason);
         idx++;
-    } else if (tokens[idx].type == TokenType::Identifier && (isalpha(tokens[idx].value[0]) || tokens[idx].value[0] == '.' || tokens[idx].value[0] == '_')) { // Label or $
+    } else if (tokens[idx].type == TokenType::Identifier && (isalpha(tokens[idx].value[0]) || tokens[idx].value[0] == '.' || tokens[idx].value[0] == '_' || tokens[idx].value[0] == '?')) { // Label, $, or ??xxxx macro-local
         if (tokens[idx].value == "$") {
              lhs = ctx.currentAddress;
          } else {
@@ -1774,18 +1784,23 @@ void assembleLine(AssemblerContext& ctx, const vector<Token>& tokens, int lineNu
     }
 }
 
-void emitAgentJSON(const AssemblerContext& ctx) {
+void emitAgentJSON(const AssemblerContext& ctx, const vector<SourceLocation>& sourceMap = {}) {
     cout << "{" << endl;
-    
+
     // 1. Success Status
     cout << "  \"success\": " << (ctx.globalError ? "false" : "true") << "," << endl;
-    
+
     // 2. Diagnostics
     cout << "  \"diagnostics\": [" << endl;
     for (size_t i = 0; i < ctx.agentState.diagnostics.size(); ++i) {
         const auto& d = ctx.agentState.diagnostics[i];
-        cout << "    { \"level\": \"" << d.level << "\", \"line\": " << d.line 
-             << ", \"msg\": \"" << jsonEscape(d.message) << "\", \"hint\": \"" << jsonEscape(d.hint) << "\" }";
+        cout << "    { \"level\": \"" << d.level << "\", \"line\": " << d.line;
+        // Add source file info if available
+        if (!sourceMap.empty() && d.line > 0 && d.line <= (int)sourceMap.size()) {
+            const auto& loc = sourceMap[d.line - 1];
+            cout << ", \"file\": \"" << jsonEscape(loc.file) << "\", \"sourceLine\": " << loc.line;
+        }
+        cout << ", \"msg\": \"" << jsonEscape(d.message) << "\", \"hint\": \"" << jsonEscape(d.hint) << "\" }";
         if (i < ctx.agentState.diagnostics.size() - 1) cout << ",";
         cout << endl;
     }
@@ -1798,9 +1813,13 @@ void emitAgentJSON(const AssemblerContext& ctx) {
         cout << "    \"" << jsonEscape(kv.first) << "\": { "
              << "\"val\": " << kv.second.value << ", "
              << "\"type\": \"" << (kv.second.isConstant ? "EQU" : "LABEL") << "\", "
-             << "\"line\": " << kv.second.definedLine 
-             << " }";
-        if (++count < ctx.symbolTable.size()) cout << ",";
+             << "\"line\": " << kv.second.definedLine;
+        if (!sourceMap.empty() && kv.second.definedLine > 0 && kv.second.definedLine <= (int)sourceMap.size()) {
+            const auto& loc = sourceMap[kv.second.definedLine - 1];
+            cout << ", \"file\": \"" << jsonEscape(loc.file) << "\", \"sourceLine\": " << loc.line;
+        }
+        cout << " }";
+        if (++count < (int)ctx.symbolTable.size()) cout << ",";
         cout << endl;
     }
     cout << "  }," << endl;
@@ -1809,11 +1828,15 @@ void emitAgentJSON(const AssemblerContext& ctx) {
     cout << "  \"listing\": [" << endl;
     for (size_t i = 0; i < ctx.agentState.listing.size(); ++i) {
         const auto& item = ctx.agentState.listing[i];
-         cout << "    { \"addr\": " << item.address 
-             << ", \"line\": " << item.sourceLine 
-             << ", \"size\": " << item.size             // <--- NEW
-             << ", \"decoded\": \"" << jsonEscape(item.decoded) << "\"" // <--- NEW
-             << ", \"src\": \"" << jsonEscape(item.sourceCode) << "\""
+         cout << "    { \"addr\": " << item.address
+             << ", \"line\": " << item.sourceLine
+             << ", \"size\": " << item.size
+             << ", \"decoded\": \"" << jsonEscape(item.decoded) << "\"";
+        if (!sourceMap.empty() && item.sourceLine > 0 && item.sourceLine <= (int)sourceMap.size()) {
+            const auto& loc = sourceMap[item.sourceLine - 1];
+            cout << ", \"file\": \"" << jsonEscape(loc.file) << "\", \"sourceLine\": " << loc.line;
+        }
+        cout << ", \"src\": \"" << jsonEscape(item.sourceCode) << "\""
              << ", \"bytes\": [";
         for(size_t b=0; b<item.bytes.size(); ++b) {
             cout << (int)item.bytes[b];
@@ -1823,7 +1846,22 @@ void emitAgentJSON(const AssemblerContext& ctx) {
         if (i < ctx.agentState.listing.size() - 1) cout << ",";
         cout << endl;
     }
-    cout << "  ]" << endl;
+    cout << "  ]," << endl;
+
+    // 5. Include file list
+    cout << "  \"includes\": [";
+    if (!sourceMap.empty()) {
+        set<string> seen;
+        vector<string> uniqueFiles;
+        for (const auto& loc : sourceMap) {
+            if (seen.insert(loc.file).second) uniqueFiles.push_back(loc.file);
+        }
+        for (size_t i = 0; i < uniqueFiles.size(); ++i) {
+            cout << "\"" << jsonEscape(uniqueFiles[i]) << "\"";
+            if (i < uniqueFiles.size() - 1) cout << ", ";
+        }
+    }
+    cout << "]" << endl;
 
     cout << "}" << endl;
 }
@@ -3141,6 +3179,8 @@ struct EmulatorConfig {
     int vpCol = 0, vpRow = 0;      // Top-left corner of viewport
     int vpWidth = 80, vpHeight = 50; // Viewport dimensions
     bool vpAttrs = false;           // Include attribute data in output
+    string screenshotFile;          // --screenshot <path.bmp>
+    bool screenshotFont8x8 = false; // --font 8x8 (default: 8x16 VGA)
 };
 
 struct Snapshot {
@@ -3186,6 +3226,7 @@ struct EmulatorResult {
     // --- Cursor ---
     int cursorRow = 0;
     int cursorCol = 0;
+    string screenshotPath;  // populated on successful BMP write
 };
 
 // --- Section 2: Core Engine ---
@@ -4247,6 +4288,8 @@ double computeFidelity(const EmulatorResult& result) {
 
 void captureViewport(const Memory& mem, const EmulatorConfig& config,
                      vector<string>& textOut, vector<string>& attrOut); // Moved up
+static bool writeScreenshotBMP(const uint8_t vram[8000],
+                                const string& filename, bool use8x8); // Forward decl
 
 EmulatorResult runEmulator(const vector<uint8_t>& binary, const EmulatorConfig& config, CPU& cpuOut) {
     EmulatorResult result;
@@ -4330,6 +4373,14 @@ EmulatorResult runEmulator(const vector<uint8_t>& binary, const EmulatorConfig& 
     }
     result.cursorRow = vram.cursorRow;
     result.cursorCol = vram.cursorCol;
+    // Write screenshot if requested
+    if (!config.screenshotFile.empty()) {
+        if (writeScreenshotBMP(mem.vram, config.screenshotFile, config.screenshotFont8x8)) {
+            result.screenshotPath = config.screenshotFile;
+        } else {
+            result.diagnostics.push_back("Failed to write screenshot: " + config.screenshotFile);
+        }
+    }
     cpuOut = cpu;
     return result;
 }
@@ -4479,10 +4530,14 @@ void emitEmulatorJSON(const EmulatorResult& result, const CPU& cpu) {
             cout << "  ]" << endl;
         }
     }
+    if (!result.screenshotPath.empty()) {
+        cout << "," << endl;
+        cout << "  \"screenshot\": \"" << jsonEscape(result.screenshotPath) << "\"";
+    }
     cout << endl << "}" << endl;
 }
 
-void emitCombinedJSON(AssemblerContext& asmCtx, const EmulatorResult& emuResult, const CPU& cpu) {
+void emitCombinedJSON(AssemblerContext& asmCtx, const EmulatorResult& emuResult, const CPU& cpu, const vector<SourceLocation>& sourceMap = {}) {
     cout << "{" << endl;
 
     // Assembly section
@@ -4494,8 +4549,12 @@ void emitCombinedJSON(AssemblerContext& asmCtx, const EmulatorResult& emuResult,
     cout << "    \"diagnostics\": [";
     for (size_t i = 0; i < asmCtx.agentState.diagnostics.size(); i++) {
         const auto& d = asmCtx.agentState.diagnostics[i];
-        cout << "{\"level\": \"" << d.level << "\", \"line\": " << d.line
-             << ", \"message\": \"" << jsonEscape(d.message) << "\"";
+        cout << "{\"level\": \"" << d.level << "\", \"line\": " << d.line;
+        if (!sourceMap.empty() && d.line > 0 && d.line <= (int)sourceMap.size()) {
+            const auto& loc = sourceMap[d.line - 1];
+            cout << ", \"file\": \"" << jsonEscape(loc.file) << "\", \"sourceLine\": " << loc.line;
+        }
+        cout << ", \"message\": \"" << jsonEscape(d.message) << "\"";
         if (!d.hint.empty()) cout << ", \"hint\": \"" << jsonEscape(d.hint) << "\"";
         cout << "}";
         if (i < asmCtx.agentState.diagnostics.size() - 1) cout << ",";
@@ -4566,8 +4625,1063 @@ void emitCombinedJSON(AssemblerContext& asmCtx, const EmulatorResult& emuResult,
             cout << "    ]" << endl;
         }
     }
+    if (!emuResult.screenshotPath.empty()) {
+        cout << "," << endl;
+        cout << "    \"screenshot\": \"" << jsonEscape(emuResult.screenshotPath) << "\"";
+    }
     cout << "  }" << endl;
     cout << "}" << endl;
+}
+
+// ============================================================
+// SCREENSHOT RENDERING — BMP OUTPUT
+// ============================================================
+
+static const uint8_t cgaPalette[16][3] = {
+    {0x00,0x00,0x00}, {0x00,0x00,0xAA}, {0x00,0xAA,0x00}, {0x00,0xAA,0xAA},
+    {0xAA,0x00,0x00}, {0xAA,0x00,0xAA}, {0xAA,0x55,0x00}, {0xAA,0xAA,0xAA},
+    {0x55,0x55,0x55}, {0x55,0x55,0xFF}, {0x55,0xFF,0x55}, {0x55,0xFF,0xFF},
+    {0xFF,0x55,0x55}, {0xFF,0x55,0xFF}, {0xFF,0xFF,0x55}, {0xFF,0xFF,0xFF},
+};
+
+#include "cp437font.h"
+
+static bool writeScreenshotBMP(const uint8_t vram[8000],
+                                const string& filename, bool use8x8) {
+    const uint8_t* font = use8x8 ? cp437_8x8 : cp437_8x16;
+    const int GLYPH_H = use8x8 ? 8 : 16;
+    const int IMG_W = 640;
+    const int IMG_H = (use8x8 ? 400 : 800);
+    const int rowStride = IMG_W * 3;  // 1920, already 4-byte aligned
+    const int pixelDataSize = rowStride * IMG_H;
+    const int fileSize = 54 + pixelDataSize;
+
+    vector<uint8_t> bmp(fileSize);
+
+    // BMP file header (14 bytes)
+    bmp[0] = 'B'; bmp[1] = 'M';
+    bmp[2] = fileSize & 0xFF; bmp[3] = (fileSize >> 8) & 0xFF;
+    bmp[4] = (fileSize >> 16) & 0xFF; bmp[5] = (fileSize >> 24) & 0xFF;
+    bmp[10] = 54;  // pixel data offset
+
+    // DIB header — BITMAPINFOHEADER (40 bytes)
+    bmp[14] = 40;  // header size
+    bmp[18] = IMG_W & 0xFF; bmp[19] = (IMG_W >> 8) & 0xFF;
+    bmp[22] = IMG_H & 0xFF; bmp[23] = (IMG_H >> 8) & 0xFF;
+    bmp[26] = 1;   // color planes
+    bmp[28] = 24;  // bits per pixel
+
+    // Render VRAM cells
+    for (int row = 0; row < 50; row++) {
+        // Skip rows beyond image height (8x8 mode only has 50*8=400 rows)
+        if (row * GLYPH_H >= IMG_H) break;
+        for (int col = 0; col < 80; col++) {
+            int idx = (row * 80 + col) * 2;
+            uint8_t ch   = vram[idx];
+            uint8_t attr = vram[idx + 1];
+            const uint8_t* fg = cgaPalette[attr & 0x0F];
+            const uint8_t* bg = cgaPalette[(attr >> 4) & 0x0F];
+            const uint8_t* glyph = font + ch * GLYPH_H;
+
+            for (int gy = 0; gy < GLYPH_H; gy++) {
+                uint8_t bits = glyph[gy];
+                int bmpY = IMG_H - 1 - (row * GLYPH_H + gy);
+                int baseX = col * 8;
+                for (int gx = 0; gx < 8; gx++) {
+                    const uint8_t* color = (bits >> (7 - gx)) & 1 ? fg : bg;
+                    int offset = 54 + bmpY * rowStride + (baseX + gx) * 3;
+                    bmp[offset]     = color[2]; // B
+                    bmp[offset + 1] = color[1]; // G
+                    bmp[offset + 2] = color[0]; // R
+                }
+            }
+        }
+    }
+
+    ofstream out(filename, ios::binary);
+    if (!out) return false;
+    out.write(reinterpret_cast<const char*>(bmp.data()), bmp.size());
+    return out.good();
+}
+
+// ============================================================
+// INCLUDE DIRECTIVE — PRE-EXPANSION
+// ============================================================
+
+static string getDirectory(const string& filepath) {
+    namespace fs = std::filesystem;
+    fs::path p(filepath);
+    fs::path dir = p.parent_path();
+    return dir.empty() ? "." : dir.string();
+}
+
+static string resolvePath(const string& baseDir, const string& includePath) {
+    namespace fs = std::filesystem;
+    fs::path inc(includePath);
+    if (inc.is_absolute()) return inc.string();
+    return (fs::path(baseDir) / inc).string();
+}
+
+static bool expandIncludesRecursive(
+    const string& filepath,
+    const string& baseDir,
+    vector<string>& outLines,
+    vector<SourceLocation>& outSourceMap,
+    vector<Diagnostic>& outErrors,
+    set<string>& includeStack,
+    int depth)
+{
+    namespace fs = std::filesystem;
+
+    if (depth > MAX_INCLUDE_DEPTH) {
+        outErrors.push_back({"ERROR", 0, "Include nesting depth exceeded (" + to_string(MAX_INCLUDE_DEPTH) + ")",
+            "Check for deeply nested or recursive INCLUDE chains"});
+        return false;
+    }
+
+    string resolvedPath = resolvePath(baseDir, filepath);
+
+    // Canonicalize for circular detection
+    string canonical;
+    try {
+        canonical = fs::canonical(resolvedPath).string();
+    } catch (...) {
+        // File doesn't exist — report error
+        outErrors.push_back({"ERROR", 0,
+            "Cannot open include file: " + resolvedPath,
+            "Resolved from: " + filepath + " relative to " + baseDir});
+        return false;
+    }
+
+    if (includeStack.count(canonical)) {
+        outErrors.push_back({"ERROR", 0,
+            "Circular include detected: " + filepath,
+            "File already in include chain: " + canonical});
+        return false;
+    }
+
+    ifstream in(resolvedPath);
+    if (!in) {
+        outErrors.push_back({"ERROR", 0,
+            "Cannot open include file: " + resolvedPath,
+            "Resolved from: " + filepath + " relative to " + baseDir});
+        return false;
+    }
+
+    vector<string> fileLines;
+    string line;
+    while (getline(in, line)) fileLines.push_back(line);
+    in.close();
+
+    includeStack.insert(canonical);
+    string fileDir = getDirectory(resolvedPath);
+
+    bool ok = true;
+    for (int i = 0; i < (int)fileLines.size(); ++i) {
+        const string& raw = fileLines[i];
+
+        // Check if this line is an INCLUDE directive
+        // Find first non-whitespace
+        size_t pos = 0;
+        while (pos < raw.size() && (raw[pos] == ' ' || raw[pos] == '\t')) pos++;
+
+        // Check for INCLUDE keyword (case-insensitive)
+        bool isInclude = false;
+        if (pos + 7 <= raw.size()) {
+            string keyword = raw.substr(pos, 7);
+            for (auto& c : keyword) c = toupper((unsigned char)c);
+            if (keyword == "INCLUDE" && (pos + 7 == raw.size() || raw[pos+7] == ' ' || raw[pos+7] == '\t' || raw[pos+7] == '\'' || raw[pos+7] == '"')) {
+                isInclude = true;
+            }
+        }
+
+        if (!isInclude) {
+            outLines.push_back(raw);
+            outSourceMap.push_back({resolvedPath, i + 1});
+            continue;
+        }
+
+        // Parse the include filename
+        size_t fnStart = pos + 7;
+        while (fnStart < raw.size() && (raw[fnStart] == ' ' || raw[fnStart] == '\t')) fnStart++;
+
+        if (fnStart >= raw.size()) {
+            outErrors.push_back({"ERROR", (int)outLines.size() + 1,
+                "INCLUDE directive missing filename",
+                "Usage: INCLUDE 'file.asm' or INCLUDE \"file.asm\" or INCLUDE file.asm"});
+            outLines.push_back("; ERROR: INCLUDE missing filename");
+            outSourceMap.push_back({resolvedPath, i + 1});
+            ok = false;
+            continue;
+        }
+
+        string incFile;
+        if (raw[fnStart] == '\'' || raw[fnStart] == '"') {
+            char quote = raw[fnStart];
+            size_t fnEnd = raw.find(quote, fnStart + 1);
+            if (fnEnd == string::npos) {
+                outErrors.push_back({"ERROR", (int)outLines.size() + 1,
+                    "Unterminated string in INCLUDE directive",
+                    "Expected closing " + string(1, quote) + " in: " + raw});
+                outLines.push_back("; ERROR: Unterminated INCLUDE string");
+                outSourceMap.push_back({resolvedPath, i + 1});
+                ok = false;
+                continue;
+            }
+            incFile = raw.substr(fnStart + 1, fnEnd - fnStart - 1);
+        } else {
+            // Bare filename — up to first whitespace or semicolon
+            size_t fnEnd = fnStart;
+            while (fnEnd < raw.size() && raw[fnEnd] != ' ' && raw[fnEnd] != '\t' && raw[fnEnd] != ';') fnEnd++;
+            incFile = raw.substr(fnStart, fnEnd - fnStart);
+        }
+
+        if (incFile.empty()) {
+            outErrors.push_back({"ERROR", (int)outLines.size() + 1,
+                "INCLUDE directive missing filename",
+                "Usage: INCLUDE 'file.asm' or INCLUDE \"file.asm\" or INCLUDE file.asm"});
+            outLines.push_back("; ERROR: INCLUDE missing filename");
+            outSourceMap.push_back({resolvedPath, i + 1});
+            ok = false;
+            continue;
+        }
+
+        // Replace INCLUDE line with marker comment
+        outLines.push_back("; >>> INCLUDE " + incFile);
+        outSourceMap.push_back({resolvedPath, i + 1});
+
+        // Recurse
+        if (!expandIncludesRecursive(incFile, fileDir, outLines, outSourceMap, outErrors, includeStack, depth + 1)) {
+            ok = false;
+        }
+
+        outLines.push_back("; <<< END INCLUDE " + incFile);
+        outSourceMap.push_back({resolvedPath, i + 1});
+    }
+
+    includeStack.erase(canonical);
+    return ok;
+}
+
+static bool expandIncludes(
+    const string& filename,
+    vector<string>& outLines,
+    vector<SourceLocation>& outSourceMap,
+    vector<Diagnostic>& outErrors)
+{
+    set<string> includeStack;
+    string baseDir = getDirectory(filename);
+    namespace fs = std::filesystem;
+    // Use just the filename part to avoid double-joining with baseDir
+    string fname = fs::path(filename).filename().string();
+    return expandIncludesRecursive(fname, baseDir, outLines, outSourceMap, outErrors, includeStack, 0);
+}
+
+// ============================================================
+// MACRO PREPROCESSOR
+// ============================================================
+
+struct MacroDefinition {
+    string name;                // upper-cased macro name
+    vector<string> params;      // parameter names, upper-cased
+    vector<string> locals;      // LOCAL label names, upper-cased
+    vector<string> body;        // raw body lines (excluding LOCAL lines)
+    int definedAtLine;          // line index (0-based) for diagnostics
+};
+
+using MacroTable = map<string, MacroDefinition>;
+
+static const int MAX_MACRO_EXPANSION_ITERATIONS = 10000;
+
+// --- Macro helper: trim whitespace ---
+static string macroTrim(const string& s) {
+    size_t start = s.find_first_not_of(" \t\r\n");
+    if (start == string::npos) return "";
+    size_t end = s.find_last_not_of(" \t\r\n");
+    return s.substr(start, end - start + 1);
+}
+
+// --- Macro helper: split a line into up to 3 parts ---
+// Returns {token1, token2, rest} where tokens are whitespace-delimited.
+// Respects ; comments and '...' strings in the rest portion.
+struct LineParts {
+    string tok1, tok2, rest;
+};
+
+static LineParts splitMacroLine(const string& line) {
+    LineParts lp;
+    size_t i = 0;
+    size_t len = line.size();
+
+    // Skip leading whitespace
+    while (i < len && (line[i] == ' ' || line[i] == '\t')) i++;
+
+    // If comment or empty, return empty
+    if (i >= len || line[i] == ';') return lp;
+
+    // Token 1
+    size_t start = i;
+    // Handle label with colon
+    while (i < len && line[i] != ' ' && line[i] != '\t' && line[i] != ';') {
+        if (line[i] == '\'') {
+            i++;
+            while (i < len && line[i] != '\'') i++;
+            if (i < len) i++;
+        } else {
+            i++;
+        }
+    }
+    lp.tok1 = line.substr(start, i - start);
+
+    // Skip whitespace
+    while (i < len && (line[i] == ' ' || line[i] == '\t')) i++;
+    if (i >= len || line[i] == ';') return lp;
+
+    // Token 2
+    start = i;
+    while (i < len && line[i] != ' ' && line[i] != '\t' && line[i] != ';') {
+        if (line[i] == '\'') {
+            i++;
+            while (i < len && line[i] != '\'') i++;
+            if (i < len) i++;
+        } else {
+            i++;
+        }
+    }
+    lp.tok2 = line.substr(start, i - start);
+
+    // Skip whitespace
+    while (i < len && (line[i] == ' ' || line[i] == '\t')) i++;
+
+    // Rest (up to comment)
+    if (i < len && line[i] != ';') {
+        lp.rest = line.substr(i);
+        // Strip trailing comment (respecting strings)
+        string cleaned;
+        bool inStr = false;
+        for (size_t j = 0; j < lp.rest.size(); j++) {
+            if (lp.rest[j] == '\'' && !inStr) { inStr = true; cleaned += lp.rest[j]; }
+            else if (lp.rest[j] == '\'' && inStr) { inStr = false; cleaned += lp.rest[j]; }
+            else if (lp.rest[j] == ';' && !inStr) { break; }
+            else { cleaned += lp.rest[j]; }
+        }
+        // Trim trailing whitespace from cleaned rest
+        size_t e = cleaned.find_last_not_of(" \t\r\n");
+        lp.rest = (e == string::npos) ? "" : cleaned.substr(0, e + 1);
+    }
+
+    return lp;
+}
+
+// --- Macro helper: parse comma-separated identifiers ---
+static vector<string> parseCommaSeparatedIdents(const string& s) {
+    vector<string> result;
+    string current;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == ';') break;
+        if (s[i] == ',') {
+            string t = macroTrim(current);
+            if (!t.empty()) result.push_back(t);
+            current.clear();
+        } else {
+            current += s[i];
+        }
+    }
+    string t = macroTrim(current);
+    if (!t.empty()) result.push_back(t);
+    return result;
+}
+
+// --- Macro helper: parse a simple numeric literal ---
+// Supports decimal, hex (h suffix or 0x prefix), binary (b suffix or 0b prefix), octal (o/q suffix)
+static int parseSimpleNumber(const string& s, bool& ok) {
+    ok = false;
+    if (s.empty()) return 0;
+    string u = toUpper(s);
+
+    int base = 10;
+    string digits = u;
+
+    char suffix = digits.back();
+    if (suffix == 'H') {
+        base = 16; digits.pop_back();
+    } else if (suffix == 'B') {
+        base = 2; digits.pop_back();
+    } else if (suffix == 'O' || suffix == 'Q') {
+        base = 8; digits.pop_back();
+    } else if (suffix == 'D') {
+        base = 10; digits.pop_back();
+    } else if (digits.size() > 2 && digits.substr(0, 2) == "0X") {
+        base = 16; digits = digits.substr(2);
+    } else if (digits.size() > 2 && digits.substr(0, 2) == "0B") {
+        base = 2; digits = digits.substr(2);
+    }
+
+    if (digits.empty()) return 0;
+
+    for (char c : digits) {
+        if (base == 2 && c != '0' && c != '1') return 0;
+        if (base == 8 && (c < '0' || c > '7')) return 0;
+        if (base == 10 && !isdigit(c)) return 0;
+        if (base == 16 && !isxdigit(c)) return 0;
+    }
+
+    try {
+        size_t pos = 0;
+        long long val = stoll(digits, &pos, base);
+        if (pos != digits.size()) return 0;
+        if (val < 0 || val > 1000000) return 0;  // reasonable limit for REPT
+        ok = true;
+        return (int)val;
+    } catch (...) {
+        return 0;
+    }
+}
+
+// --- Macro helper: check if a word is a reserved instruction/register/directive ---
+static bool isMacroReservedWord(const string& upper) {
+    static const set<string> reserved = {
+        // Registers
+        "AX", "BX", "CX", "DX", "SP", "BP", "SI", "DI",
+        "AL", "AH", "BL", "BH", "CL", "CH", "DL", "DH",
+        "CS", "DS", "ES", "SS", "IP",
+        // Instructions (common subset)
+        "MOV", "ADD", "SUB", "MUL", "DIV", "IMUL", "IDIV",
+        "INC", "DEC", "NEG", "NOT",
+        "AND", "OR", "XOR", "TEST", "CMP",
+        "PUSH", "POP", "PUSHF", "POPF",
+        "JMP", "JE", "JNE", "JZ", "JNZ", "JG", "JGE", "JL", "JLE",
+        "JA", "JAE", "JB", "JBE", "JC", "JNC", "JO", "JNO", "JS", "JNS",
+        "JCXZ", "LOOP", "LOOPE", "LOOPNE", "LOOPZ", "LOOPNZ",
+        "CALL", "RET", "RETF", "INT", "IRET", "INTO",
+        "NOP", "HLT", "CLC", "STC", "CMC", "CLD", "STD", "CLI", "STI",
+        "SHL", "SHR", "SAL", "SAR", "ROL", "ROR", "RCL", "RCR",
+        "LEA", "LDS", "LES", "XCHG", "XLAT", "XLATB",
+        "CBW", "CWD", "AAA", "AAD", "AAM", "AAS", "DAA", "DAS",
+        "IN", "OUT", "INS", "OUTS", "INSB", "INSW", "OUTSB", "OUTSW",
+        "MOVSB", "MOVSW", "CMPSB", "CMPSW", "SCASB", "SCASW",
+        "LODSB", "LODSW", "STOSB", "STOSW",
+        "REP", "REPE", "REPNE", "REPZ", "REPNZ",
+        "LOCK", "WAIT", "ESC",
+        "LAHF", "SAHF",
+        // Directives
+        "ORG", "DB", "DW", "EQU", "PROC", "ENDP", "SEGMENT", "ENDS",
+        "ASSUME", "END", "INCLUDE",
+        "MACRO", "ENDM", "LOCAL", "REPT", "IRP",
+        // Size specifiers
+        "BYTE", "WORD", "PTR", "OFFSET", "SHORT", "NEAR", "FAR",
+        "DUP",
+    };
+    return reserved.count(upper) > 0;
+}
+
+// --- Macro helper: substitute parameters in a body line ---
+static string substituteParams(
+    const string& line,
+    const vector<string>& paramNames,  // upper-cased
+    const vector<string>& argValues,
+    const vector<string>& localNames,  // upper-cased
+    const vector<string>& localReplacements)
+{
+    string result;
+    size_t i = 0;
+    size_t len = line.size();
+    bool inString = false;
+    bool inComment = false;
+
+    while (i < len) {
+        if (inComment) {
+            result += line[i++];
+            continue;
+        }
+
+        if (line[i] == ';' && !inString) {
+            inComment = true;
+            result += line[i++];
+            continue;
+        }
+
+        if (line[i] == '\'') {
+            inString = !inString;
+            result += line[i++];
+            continue;
+        }
+
+        if (inString) {
+            result += line[i++];
+            continue;
+        }
+
+        // & concatenation operator - consume it
+        if (line[i] == '&') {
+            i++;
+            continue;
+        }
+
+        // Identifier characters
+        if (isalnum(line[i]) || line[i] == '_' || line[i] == '?' || line[i] == '.') {
+            size_t start = i;
+            while (i < len && (isalnum(line[i]) || line[i] == '_' || line[i] == '?' || line[i] == '.')) i++;
+            string word = line.substr(start, i - start);
+            string upper = toUpper(word);
+
+            // Check parameters
+            bool replaced = false;
+            for (size_t p = 0; p < paramNames.size(); p++) {
+                if (upper == paramNames[p]) {
+                    result += (p < argValues.size()) ? argValues[p] : "";
+                    replaced = true;
+                    break;
+                }
+            }
+            if (!replaced) {
+                // Check locals
+                for (size_t l = 0; l < localNames.size(); l++) {
+                    if (upper == localNames[l]) {
+                        result += localReplacements[l];
+                        replaced = true;
+                        break;
+                    }
+                }
+            }
+            if (!replaced) {
+                result += word;
+            }
+        } else {
+            result += line[i++];
+        }
+    }
+
+    return result;
+}
+
+// --- Macro helper: parse invocation arguments ---
+// Comma-separated, but commas inside <...> or '...' don't count as separators.
+static vector<string> parseMacroArguments(const string& argStr) {
+    vector<string> args;
+    if (macroTrim(argStr).empty()) return args;
+
+    string current;
+    int angleBracketDepth = 0;
+    bool inString = false;
+
+    for (size_t i = 0; i < argStr.size(); i++) {
+        char c = argStr[i];
+
+        if (c == ';' && !inString && angleBracketDepth == 0) break;
+
+        if (c == '\'' && angleBracketDepth == 0) {
+            inString = !inString;
+            current += c;
+        } else if (c == '<' && !inString) {
+            angleBracketDepth++;
+            current += c;
+        } else if (c == '>' && !inString && angleBracketDepth > 0) {
+            angleBracketDepth--;
+            current += c;
+        } else if (c == ',' && !inString && angleBracketDepth == 0) {
+            args.push_back(macroTrim(current));
+            current.clear();
+        } else {
+            current += c;
+        }
+    }
+
+    string t = macroTrim(current);
+    if (!t.empty()) args.push_back(t);
+
+    return args;
+}
+
+// --- Macro helper: find matching ENDM, tracking nested blocks ---
+// Returns index of ENDM line, or -1 if not found.
+static int findMatchingEndm(const vector<string>& lines, int startAfter) {
+    int depth = 1;
+    for (int i = startAfter; i < (int)lines.size(); i++) {
+        LineParts lp = splitMacroLine(lines[i]);
+        string u1 = toUpper(lp.tok1);
+        string u2 = toUpper(lp.tok2);
+
+        // Check for nested MACRO/REPT/IRP
+        if (u2 == "MACRO" || u1 == "REPT" || u1 == "IRP") {
+            depth++;
+        } else if (u1 == "ENDM") {
+            depth--;
+            if (depth == 0) return i;
+        }
+    }
+    return -1;
+}
+
+// --- expandRept: expand a REPT/ENDM block in place ---
+static bool expandRept(
+    vector<string>& lines,
+    vector<SourceLocation>& sourceMap,
+    vector<Diagnostic>& outErrors,
+    int reptLine)
+{
+    LineParts lp = splitMacroLine(lines[reptLine]);
+    // lp.tok1 = "REPT", lp.tok2 = count
+
+    if (lp.tok2.empty()) {
+        outErrors.push_back({
+            "ERROR", sourceMap[reptLine].line,
+            "REPT directive missing repeat count",
+            "Usage: REPT <count>"
+        });
+        return false;
+    }
+
+    bool numOk = false;
+    int count = parseSimpleNumber(lp.tok2, numOk);
+    if (!numOk || count < 0) {
+        outErrors.push_back({
+            "ERROR", sourceMap[reptLine].line,
+            "REPT count must be a non-negative numeric literal",
+            "Got: '" + lp.tok2 + "'"
+        });
+        return false;
+    }
+
+    int endmLine = findMatchingEndm(lines, reptLine + 1);
+    if (endmLine < 0) {
+        outErrors.push_back({
+            "ERROR", sourceMap[reptLine].line,
+            "REPT without matching ENDM",
+            ""
+        });
+        return false;
+    }
+
+    // Collect body lines
+    vector<string> body;
+    for (int i = reptLine + 1; i < endmLine; i++) {
+        body.push_back(lines[i]);
+    }
+
+    SourceLocation invocLoc = sourceMap[reptLine];
+
+    // Build expansion
+    vector<string> expansion;
+    expansion.push_back("; >>> REPT " + lp.tok2);
+    for (int r = 0; r < count; r++) {
+        for (const auto& bline : body) {
+            expansion.push_back(bline);
+        }
+    }
+    expansion.push_back("; <<< END REPT");
+
+    // Splice: replace [reptLine .. endmLine] with expansion
+    vector<string> newLines;
+    vector<SourceLocation> newMap;
+    for (int i = 0; i < reptLine; i++) {
+        newLines.push_back(lines[i]);
+        newMap.push_back(sourceMap[i]);
+    }
+    for (const auto& el : expansion) {
+        newLines.push_back(el);
+        newMap.push_back(invocLoc);
+    }
+    for (int i = endmLine + 1; i < (int)lines.size(); i++) {
+        newLines.push_back(lines[i]);
+        newMap.push_back(sourceMap[i]);
+    }
+    lines = move(newLines);
+    sourceMap = move(newMap);
+    return true;
+}
+
+// --- expandIrp: expand an IRP/ENDM block in place ---
+static bool expandIrp(
+    vector<string>& lines,
+    vector<SourceLocation>& sourceMap,
+    vector<Diagnostic>& outErrors,
+    int irpLine)
+{
+    // IRP param, <item1, item2, ...>
+    // We need to parse: tok1=IRP, tok2=param, rest=, <items>
+    LineParts lp = splitMacroLine(lines[irpLine]);
+
+    if (lp.tok2.empty()) {
+        outErrors.push_back({
+            "ERROR", sourceMap[irpLine].line,
+            "IRP directive missing parameter name",
+            "Usage: IRP param, <item1, item2, ...>"
+        });
+        return false;
+    }
+
+    string paramName = toUpper(lp.tok2);
+    // Remove trailing comma from param if present
+    if (!paramName.empty() && paramName.back() == ',') {
+        paramName.pop_back();
+    }
+
+    // The rest should be: , <items> or <items>
+    string rest = lp.rest;
+    // If tok2 didn't have trailing comma, rest should start with comma
+    string upperTok2 = toUpper(lp.tok2);
+    if (upperTok2.back() != ',') {
+        // rest should start with comma
+        rest = macroTrim(rest);
+        if (rest.empty() || rest[0] != ',') {
+            outErrors.push_back({
+                "ERROR", sourceMap[irpLine].line,
+                "IRP directive missing comma after parameter name",
+                "Usage: IRP param, <item1, item2, ...>"
+            });
+            return false;
+        }
+        rest = macroTrim(rest.substr(1));
+    } else {
+        rest = macroTrim(rest);
+    }
+
+    // rest should now be <items>
+    if (rest.empty() || rest[0] != '<') {
+        outErrors.push_back({
+            "ERROR", sourceMap[irpLine].line,
+            "IRP directive missing angle-bracket list",
+            "Usage: IRP param, <item1, item2, ...>"
+        });
+        return false;
+    }
+
+    // Find matching >
+    size_t closePos = string::npos;
+    int depth = 0;
+    for (size_t i = 0; i < rest.size(); i++) {
+        if (rest[i] == '<') depth++;
+        else if (rest[i] == '>') {
+            depth--;
+            if (depth == 0) { closePos = i; break; }
+        }
+    }
+    if (closePos == string::npos) {
+        outErrors.push_back({
+            "ERROR", sourceMap[irpLine].line,
+            "IRP directive has unmatched '<'",
+            "Usage: IRP param, <item1, item2, ...>"
+        });
+        return false;
+    }
+
+    string itemsStr = rest.substr(1, closePos - 1);  // strip < >
+
+    // Parse items (comma-separated)
+    vector<string> items = parseCommaSeparatedIdents(itemsStr);
+
+    int endmLine = findMatchingEndm(lines, irpLine + 1);
+    if (endmLine < 0) {
+        outErrors.push_back({
+            "ERROR", sourceMap[irpLine].line,
+            "IRP without matching ENDM",
+            ""
+        });
+        return false;
+    }
+
+    // Collect body lines
+    vector<string> body;
+    for (int i = irpLine + 1; i < endmLine; i++) {
+        body.push_back(lines[i]);
+    }
+
+    SourceLocation invocLoc = sourceMap[irpLine];
+
+    // Build expansion
+    vector<string> expansion;
+    expansion.push_back("; >>> IRP " + lp.tok2);
+    vector<string> paramNames = { paramName };
+    vector<string> emptyLocals, emptyLocalRepls;
+
+    for (const auto& item : items) {
+        vector<string> argVals = { item };
+        for (const auto& bline : body) {
+            expansion.push_back(substituteParams(bline, paramNames, argVals, emptyLocals, emptyLocalRepls));
+        }
+    }
+    expansion.push_back("; <<< END IRP");
+
+    // Splice: replace [irpLine .. endmLine] with expansion
+    vector<string> newLines;
+    vector<SourceLocation> newMap;
+    for (int i = 0; i < irpLine; i++) {
+        newLines.push_back(lines[i]);
+        newMap.push_back(sourceMap[i]);
+    }
+    for (const auto& el : expansion) {
+        newLines.push_back(el);
+        newMap.push_back(invocLoc);
+    }
+    for (int i = endmLine + 1; i < (int)lines.size(); i++) {
+        newLines.push_back(lines[i]);
+        newMap.push_back(sourceMap[i]);
+    }
+    lines = move(newLines);
+    sourceMap = move(newMap);
+    return true;
+}
+
+// --- Main macro expansion function ---
+static bool expandMacros(
+    vector<string>& lines,
+    vector<SourceLocation>& sourceMap,
+    vector<Diagnostic>& outErrors)
+{
+    MacroTable macros;
+    static int localCounter = 0;
+
+    // ==========================================
+    // Phase 1: Collect macro definitions
+    // ==========================================
+    for (int i = 0; i < (int)lines.size(); /* no increment */) {
+        LineParts lp = splitMacroLine(lines[i]);
+        string u1 = toUpper(lp.tok1);
+        string u2 = toUpper(lp.tok2);
+
+        // Detect "name MACRO [params]"
+        if (u2 == "MACRO") {
+            string macroName = toUpper(lp.tok1);
+
+            // Validate name
+            if (isMacroReservedWord(macroName)) {
+                outErrors.push_back({
+                    "ERROR", sourceMap[i].line,
+                    "Cannot define macro with reserved name '" + macroName + "'",
+                    ""
+                });
+                return false;
+            }
+
+            // Check redefinition
+            if (macros.count(macroName)) {
+                outErrors.push_back({
+                    "WARNING", sourceMap[i].line,
+                    "Macro '" + macroName + "' redefined (previous at line " +
+                    to_string(macros[macroName].definedAtLine + 1) + ")",
+                    ""
+                });
+            }
+
+            // Parse parameters
+            vector<string> params;
+            if (!lp.rest.empty()) {
+                vector<string> rawParams = parseCommaSeparatedIdents(lp.rest);
+                for (const auto& p : rawParams) {
+                    params.push_back(toUpper(p));
+                }
+            }
+
+            // Find matching ENDM
+            int endmLine = findMatchingEndm(lines, i + 1);
+            if (endmLine < 0) {
+                outErrors.push_back({
+                    "ERROR", sourceMap[i].line,
+                    "MACRO '" + macroName + "' without matching ENDM",
+                    ""
+                });
+                return false;
+            }
+
+            // Collect body, extracting LOCAL declarations
+            MacroDefinition def;
+            def.name = macroName;
+            def.params = params;
+            def.definedAtLine = i;
+
+            for (int j = i + 1; j < endmLine; j++) {
+                LineParts bodyLp = splitMacroLine(lines[j]);
+                if (toUpper(bodyLp.tok1) == "LOCAL") {
+                    // Parse LOCAL names
+                    string localArgs = bodyLp.tok2;
+                    if (!bodyLp.rest.empty()) localArgs += " " + bodyLp.rest;
+                    vector<string> localNames = parseCommaSeparatedIdents(localArgs);
+                    for (const auto& ln : localNames) {
+                        def.locals.push_back(toUpper(ln));
+                    }
+                } else {
+                    def.body.push_back(lines[j]);
+                }
+            }
+
+            macros[macroName] = def;
+
+            // Replace definition lines with comments
+            for (int j = i; j <= endmLine; j++) {
+                lines[j] = "; [MACRO DEF] " + lines[j];
+            }
+
+            i = endmLine + 1;
+            continue;
+        }
+
+        // Skip REPT/IRP blocks in phase 1 (they'll be expanded in phase 2)
+        if (u1 == "REPT" || u1 == "IRP") {
+            int endmLine = findMatchingEndm(lines, i + 1);
+            if (endmLine < 0) {
+                outErrors.push_back({
+                    "ERROR", sourceMap[i].line,
+                    u1 + " without matching ENDM",
+                    ""
+                });
+                return false;
+            }
+            i = endmLine + 1;
+            continue;
+        }
+
+        // Detect orphan ENDM
+        if (u1 == "ENDM") {
+            outErrors.push_back({
+                "ERROR", sourceMap[i].line,
+                "ENDM without matching MACRO, REPT, or IRP",
+                ""
+            });
+            return false;
+        }
+
+        i++;
+    }
+
+    // If no macros defined and no REPT/IRP, quick check
+    if (macros.empty()) {
+        // Still need to check for REPT/IRP
+        bool hasReptIrp = false;
+        for (const auto& line : lines) {
+            LineParts lp = splitMacroLine(line);
+            string u1 = toUpper(lp.tok1);
+            if (u1 == "REPT" || u1 == "IRP") { hasReptIrp = true; break; }
+        }
+        if (!hasReptIrp) return true;
+    }
+
+    // ==========================================
+    // Phase 2: Iterative expansion
+    // ==========================================
+    for (int iteration = 0; iteration < MAX_MACRO_EXPANSION_ITERATIONS; iteration++) {
+        bool expanded = false;
+
+        for (int i = 0; i < (int)lines.size(); i++) {
+            // Skip comments and blank lines
+            string trimmed = macroTrim(lines[i]);
+            if (trimmed.empty() || trimmed[0] == ';') continue;
+
+            LineParts lp = splitMacroLine(lines[i]);
+            string u1 = toUpper(lp.tok1);
+            string u2 = toUpper(lp.tok2);
+
+            // Check for REPT
+            if (u1 == "REPT") {
+                if (!expandRept(lines, sourceMap, outErrors, i)) return false;
+                expanded = true;
+                break;  // restart scan
+            }
+
+            // Check for IRP
+            if (u1 == "IRP") {
+                if (!expandIrp(lines, sourceMap, outErrors, i)) return false;
+                expanded = true;
+                break;  // restart scan
+            }
+
+            // Check for macro invocation
+            // Case 1: first token is macro name: "MacroName arg1, arg2"
+            // Case 2: first token is a label, second is macro name: "label: MacroName arg1"
+            string macroName;
+            string argStr;
+            string labelPrefix;
+
+            if (macros.count(u1)) {
+                macroName = u1;
+                // Arguments are tok2 + rest
+                argStr = lp.tok2;
+                if (!lp.rest.empty()) {
+                    if (!argStr.empty()) argStr += " ";
+                    argStr += lp.rest;
+                }
+            } else if (lp.tok1.size() > 0 && lp.tok1.back() == ':' && macros.count(u2)) {
+                // Label before macro invocation
+                macroName = u2;
+                labelPrefix = lp.tok1;
+                argStr = lp.rest;
+            }
+
+            if (!macroName.empty()) {
+                const MacroDefinition& def = macros[macroName];
+
+                // Parse arguments
+                vector<string> args = parseMacroArguments(argStr);
+
+                // Warn on argument count mismatch
+                if (args.size() < def.params.size()) {
+                    outErrors.push_back({
+                        "WARNING", sourceMap[i].line,
+                        "Macro '" + macroName + "' invoked with " + to_string(args.size()) +
+                        " args, expected " + to_string(def.params.size()),
+                        "Missing arguments will be empty strings"
+                    });
+                } else if (args.size() > def.params.size()) {
+                    outErrors.push_back({
+                        "WARNING", sourceMap[i].line,
+                        "Macro '" + macroName + "' invoked with " + to_string(args.size()) +
+                        " args, expected " + to_string(def.params.size()),
+                        "Extra arguments will be ignored"
+                    });
+                }
+
+                // Generate LOCAL label replacements
+                vector<string> localReplacements;
+                for (size_t l = 0; l < def.locals.size(); l++) {
+                    char buf[16];
+                    snprintf(buf, sizeof(buf), "??%04X", localCounter++);
+                    localReplacements.push_back(string(buf));
+                }
+
+                SourceLocation invocLoc = sourceMap[i];
+
+                // Build expansion
+                vector<string> expansion;
+                if (!labelPrefix.empty()) {
+                    expansion.push_back(labelPrefix);
+                }
+                expansion.push_back("; >>> MACRO " + macroName);
+                for (const auto& bodyLine : def.body) {
+                    expansion.push_back(substituteParams(bodyLine, def.params, args, def.locals, localReplacements));
+                }
+                expansion.push_back("; <<< END MACRO " + macroName);
+
+                // Splice: replace line i with expansion
+                vector<string> newLines;
+                vector<SourceLocation> newMap;
+                for (int j = 0; j < i; j++) {
+                    newLines.push_back(lines[j]);
+                    newMap.push_back(sourceMap[j]);
+                }
+                for (const auto& el : expansion) {
+                    newLines.push_back(el);
+                    newMap.push_back(invocLoc);
+                }
+                for (int j = i + 1; j < (int)lines.size(); j++) {
+                    newLines.push_back(lines[j]);
+                    newMap.push_back(sourceMap[j]);
+                }
+                lines = move(newLines);
+                sourceMap = move(newMap);
+                expanded = true;
+                break;  // restart scan
+            }
+        }
+
+        if (!expanded) return true;  // stable — done
+    }
+
+    outErrors.push_back({
+        "ERROR", 0,
+        "Macro expansion iteration limit exceeded (" + to_string(MAX_MACRO_EXPANSION_ITERATIONS) + ")",
+        "Check for recursive or mutually-recursive macro invocations"
+    });
+    return false;
 }
 
 // ============================================================
@@ -4666,6 +5780,18 @@ int main(int argc, char* argv[]) {
             }
         } else if (arg == "--attrs") {
             emuConfig.vpAttrs = true;
+        } else if (arg == "--screenshot" && i + 1 < argc) {
+            ++i;
+            emuConfig.screenshotFile = argv[i];
+        } else if (arg == "--font" && i + 1 < argc) {
+            ++i;
+            string fontArg = argv[i];
+            if (fontArg == "8x8") {
+                emuConfig.screenshotFont8x8 = true;
+            } else if (fontArg != "8x16") {
+                cerr << "Unknown font: " << fontArg << ". Use 8x8 or 8x16." << endl;
+                return 1;
+            }
         } else if (arg == "--output-file" && i + 1 < argc) {
             ++i;
             emuConfig.outputFile = argv[i];
@@ -4721,17 +5847,33 @@ int main(int argc, char* argv[]) {
             cout << "{ \"error\": \"No input file\" }" << endl;
             return 0;
         }
-        ifstream srcIn(filename);
-        if (!srcIn) {
-            cout << "{ \"error\": \"Cannot open file: " << jsonEscape(filename) << "\" }" << endl;
-            return 1;
-        }
         vector<string> lines;
-        string line;
-        while (getline(srcIn, line)) lines.push_back(line);
-        srcIn.close();
+        vector<SourceLocation> sourceMap;
+        vector<Diagnostic> expandErrors;
+        if (!expandIncludes(filename, lines, sourceMap, expandErrors)) {
+            // Report expand errors through a minimal context and bail
+            AssemblerContext ctx;
+            for (const auto& e : expandErrors) ctx.agentState.diagnostics.push_back(e);
+            ctx.globalError = true;
+            emitCombinedJSON(ctx, EmulatorResult(), CPU(), sourceMap);
+            return 0;
+        }
+
+        // Expand macros (MACRO/ENDM, REPT, IRP)
+        vector<Diagnostic> macroErrors;
+        if (!expandMacros(lines, sourceMap, macroErrors)) {
+            AssemblerContext ctx;
+            for (const auto& e : macroErrors) ctx.agentState.diagnostics.push_back(e);
+            ctx.globalError = true;
+            emitCombinedJSON(ctx, EmulatorResult(), CPU(), sourceMap);
+            return 0;
+        }
+        // Forward any macro warnings
+        // (they'll be merged into ctx diagnostics after ctx is created)
+        vector<Diagnostic> savedMacroWarnings = macroErrors;
 
         AssemblerContext ctx;
+        for (const auto& w : savedMacroWarnings) ctx.agentState.diagnostics.push_back(w);
         // Pass 1
         ctx.isPass1 = true; ctx.currentAddress = 0;
         for (int i = 0; i < (int)lines.size(); ++i) {
@@ -4740,6 +5882,7 @@ int main(int argc, char* argv[]) {
         }
         // Pass 2
         ctx.agentState.diagnostics.clear();
+        for (const auto& w : savedMacroWarnings) ctx.agentState.diagnostics.push_back(w);
         ctx.globalError = false;
         ctx.isPass1 = false; ctx.currentAddress = 0; ctx.machineCode.clear();
         for (int i = 0; i < (int)lines.size(); ++i) {
@@ -4748,13 +5891,13 @@ int main(int argc, char* argv[]) {
         }
 
         if (ctx.globalError) {
-            emitCombinedJSON(ctx, EmulatorResult(), CPU());
+            emitCombinedJSON(ctx, EmulatorResult(), CPU(), sourceMap);
             return 0;
         }
 
         CPU finalCpu;
         EmulatorResult emuResult = runEmulator(ctx.machineCode, emuConfig, finalCpu);
-        emitCombinedJSON(ctx, emuResult, finalCpu);
+        emitCombinedJSON(ctx, emuResult, finalCpu, sourceMap);
         return 0;
     }
 
@@ -4772,20 +5915,43 @@ int main(int argc, char* argv[]) {
         outfile = filename.substr(0, filename.size()-4) + ".com";
     }
 
-    ifstream in(filename);
-    if (!in) {
-        cerr << "Cannot open " << filename << endl;
+    vector<string> lines;
+    vector<SourceLocation> sourceMap;
+    vector<Diagnostic> expandErrors;
+    if (!expandIncludes(filename, lines, sourceMap, expandErrors)) {
+        if (agentMode) {
+            AssemblerContext ctx;
+            for (const auto& e : expandErrors) ctx.agentState.diagnostics.push_back(e);
+            ctx.globalError = true;
+            emitAgentJSON(ctx, sourceMap);
+            return 0;
+        }
+        for (const auto& e : expandErrors) cerr << e.message << endl;
         return 1;
     }
-    vector<string> lines;
-    string line;
-    while (getline(in, line)) {
-        lines.push_back(line);
+
+    // Expand macros (MACRO/ENDM, REPT, IRP)
+    {
+        vector<Diagnostic> macroErrors;
+        if (!expandMacros(lines, sourceMap, macroErrors)) {
+            if (agentMode) {
+                AssemblerContext ctx;
+                for (const auto& e : macroErrors) ctx.agentState.diagnostics.push_back(e);
+                ctx.globalError = true;
+                emitAgentJSON(ctx, sourceMap);
+                return 0;
+            }
+            for (const auto& e : macroErrors) cerr << e.message << endl;
+            return 1;
+        }
+        // Macro warnings will be merged into ctx below
+        expandErrors.insert(expandErrors.end(), macroErrors.begin(), macroErrors.end());
     }
-    in.close();
 
     // Context instantiation
     AssemblerContext ctx;
+    // Forward macro warnings into assembler diagnostics
+    for (const auto& w : expandErrors) ctx.agentState.diagnostics.push_back(w);
 
     // Pass 1
     ctx.isPass1 = true;
@@ -4797,6 +5963,7 @@ int main(int argc, char* argv[]) {
 
     // Pass 2
     ctx.agentState.diagnostics.clear();
+    for (const auto& w : expandErrors) ctx.agentState.diagnostics.push_back(w);
     ctx.globalError = false;
 
     ctx.isPass1 = false;
@@ -4809,7 +5976,7 @@ int main(int argc, char* argv[]) {
 
     if (ctx.globalError) {
         if (agentMode) {
-            emitAgentJSON(ctx);
+            emitAgentJSON(ctx, sourceMap);
             return 0;
         }
         cerr << "Assembly failed with errors." << endl;
@@ -4822,7 +5989,7 @@ int main(int argc, char* argv[]) {
     out.close();
 
     if (agentMode) {
-        emitAgentJSON(ctx);
+        emitAgentJSON(ctx, sourceMap);
         return 0;
     }
 

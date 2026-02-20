@@ -69,6 +69,8 @@ agent86 --run hello.com
 | `--screen` | **Capture full 80×50 screen** from VRAM into JSON output. | Off |
 | `--viewport <col,row,w,h>` | **Capture a rectangular region** of the screen. Implies `--screen` behavior but only for the specified window. | Off |
 | `--attrs` | **Include attribute bytes** in screen output. Emits `screenAttrs[]` alongside `screen[]`. | Off |
+| `--screenshot <file.bmp>` | **Render VRAM as a BMP image file.** Writes a 24-bit BMP using CP437 fonts with CGA 16-color palette. | Off |
+| `--font 8x8\|8x16` | **Select font size for screenshot.** `8x16` (default) produces 640x800, `8x8` produces 640x400. | 8x16 |
 | `--output-file <path>` | **Write JSON to file** instead of stdout. Bypasses shell encoding issues (no BOM, no re-encoding). | stdout |
 
 ### Flag Usage Patterns
@@ -134,6 +136,16 @@ agent86 --run-source colors.asm --screen --attrs
 agent86 --run-source life.asm --viewport 0,0,40,40 --breakpoints 0150
 ```
 
+**Render the screen as a BMP image:**
+```bash
+agent86 --run-source life.asm --screenshot screen.bmp
+```
+
+**Render with the smaller 8x8 font (640x400 instead of 640x800):**
+```bash
+agent86 --run-source life.asm --screenshot screen.bmp --font 8x8
+```
+
 **Write output to file (avoids PowerShell encoding issues):**
 ```bash
 agent86 --run-source life.asm --screen --output-file result.json
@@ -159,8 +171,8 @@ Every `--agent` invocation produces a single JSON object on stdout with this str
   ],
 
   "symbols": {
-    "START": { "val": 0, "type": "LABEL", "line": 1 },
-    "BUFSIZE": { "val": 256, "type": "EQU", "line": 2 }
+    "START": { "val": 0, "type": "LABEL", "line": 1, "file": "main.asm", "sourceLine": 1 },
+    "BUFSIZE": { "val": 256, "type": "EQU", "line": 2, "file": "main.asm", "sourceLine": 2 }
   },
 
   "listing": [
@@ -169,10 +181,14 @@ Every `--agent` invocation produces a single JSON object on stdout with this str
       "line": 3,
       "size": 3,
       "decoded": "MOV REG(AX), IMM(5)",
+      "file": "main.asm",
+      "sourceLine": 3,
       "src": "    MOV AX, 5",
       "bytes": [184, 5, 0]
     }
-  ]
+  ],
+
+  "includes": ["main.asm"]
 }
 ```
 
@@ -182,22 +198,30 @@ Every `--agent` invocation produces a single JSON object on stdout with this str
 
 **`diagnostics[]`** — All errors and warnings from pass 2. Each entry contains:
 - `level`: Severity. `ERROR` means assembly failed. `WARNING` means the binary was produced but something may be wrong (e.g., 80186-only encoding used). `INFO` is advisory.
-- `line`: 1-indexed source line number.
+- `line`: 1-indexed source line number (flat index across all included files).
+- `file`: *(when INCLUDE is used)* Path of the source file where this diagnostic originated.
+- `sourceLine`: *(when INCLUDE is used)* 1-indexed line number within that specific file.
 - `msg`: Human-readable description of the problem.
 - `hint`: Agent-actionable context. Contains a concrete fix, valid alternatives, or a code pattern you can apply directly. **Always read this field first — every diagnostic now includes an actionable hint written specifically for you.**
 
 **`symbols{}`** — The complete symbol table after assembly. Each key is an uppercase symbol name.
 - `val`: Resolved integer value (address for labels, constant for EQU).
 - `type`: `"LABEL"` (address in code) or `"EQU"` (compile-time constant).
-- `line`: Source line where the symbol was defined.
+- `line`: Source line where the symbol was defined (flat index).
+- `file`: *(when INCLUDE is used)* Path of the source file where the symbol was defined.
+- `sourceLine`: *(when INCLUDE is used)* 1-indexed line number within that specific file.
 
 **`listing[]`** — One entry per instruction/directive that emitted bytes. This is your primary debugging view.
 - `addr`: Starting byte address of this instruction in the binary.
-- `line`: Source line number.
+- `line`: Source line number (flat index).
 - `size`: Number of bytes emitted.
 - `decoded`: How the assembler *interpreted* your instruction (e.g., `MOV REG(AX), IMM(5)`). **Compare this against your intent to detect misparses.**
+- `file`: *(when INCLUDE is used)* Path of the source file containing this line.
+- `sourceLine`: *(when INCLUDE is used)* 1-indexed line number within that specific file.
 - `src`: Original source text.
 - `bytes`: Raw machine code bytes as decimal integers.
+
+**`includes[]`** — List of all source files involved in the assembly, in the order they were first encountered. Always present (contains at least the top-level file).
 
 ### Error-Only Output
 
@@ -280,6 +304,8 @@ If assembly fails, the `emulation` section will have `success: false` with no me
 
 **`screenAttrs[]`** — *(Only present when `--attrs` is also used.)* Array of strings, one per row, parallel to `screen[]`. Each string contains two hex digits per cell representing the CGA text-mode attribute byte (e.g., `"07"` = light grey on black, `"1F"` = white on blue). Omitted unless `--attrs` is specified.
 
+**`screenshot`** — *(Only present when `--screenshot` is used and the BMP was written successfully.)* String containing the path to the rendered BMP file. The image uses CP437 fonts with the CGA 16-color palette. Resolution depends on `--font`: 640x800 for `8x16` (default), 640x400 for `8x8`.
+
 **`skipped[]`** — Instructions that were encountered but not fully emulated (e.g., unimplemented interrupts, I/O ports). Each entry:
 - `instruction`: Disassembly text of the skipped instruction.
 - `reason`: Why it was skipped.
@@ -298,6 +324,7 @@ The `--run` flag runs a pre-compiled `.COM` binary. The JSON output is the same 
 - `snapshots[]`: Breakpoint and watchpoint snapshots (see Breakpoints section).
 - `screen[]`: Screen text (when `--screen` or `--viewport` is used).
 - `screenAttrs[]`: Attribute hex strings (when `--attrs` is also used).
+- `screenshot`: Path to rendered BMP file (when `--screenshot` is used and the file was written successfully).
 
 ---
 
@@ -694,6 +721,182 @@ Any other AH value is logged in `skipped[]` as `"Unimplemented DOS function"`.
 | `EQU` | `BUFSIZE EQU 256` | Define a compile-time constant. Does not emit bytes. |
 | `PROC` | `myproc: PROC` | Begin a named procedure (enables local labels). |
 | `ENDP` | `ENDP` | End the current procedure scope. |
+| `INCLUDE` | `INCLUDE 'file.asm'` | Insert the contents of another source file at this point. Supports single-quoted, double-quoted, or bare filenames. Relative paths resolve from the including file's directory. Nesting up to 16 levels; circular includes are detected. |
+| `MACRO` | `name MACRO [params]` | Begin a named macro definition. Parameters are comma-separated identifiers substituted at invocation. |
+| `ENDM` | `ENDM` | End a `MACRO`, `REPT`, or `IRP` block. |
+| `LOCAL` | `LOCAL lab1, lab2` | Declare labels inside a MACRO body that get unique names (`??XXXX`) per expansion. Must appear before any instructions in the macro body. |
+| `REPT` | `REPT 5` | Repeat the enclosed block N times. Count must be a non-negative numeric literal. |
+| `IRP` | `IRP reg, <AX,BX,CX>` | Iterate: expand the body once for each item in the angle-bracket list, substituting the parameter. |
+
+### INCLUDE Directive
+
+Split source across multiple files for organization — data definitions, constants, subroutines, etc. can live in separate files.
+
+```asm
+; main.asm
+ORG 100h
+    MOV AH, 9
+    MOV DX, msg
+    INT 21h
+    INT 20h
+INCLUDE 'data.asm'          ; single quotes
+INCLUDE "lib/utils.asm"     ; double quotes, relative path
+INCLUDE constants.inc       ; bare filename (no quotes)
+```
+
+**Syntax:** `INCLUDE` must be the first non-whitespace token on the line. Trailing comments (after `;`) are allowed. The keyword is case-insensitive (`include`, `Include`, `INCLUDE` all work).
+
+**Path resolution:** Relative paths resolve from the directory of the file containing the INCLUDE, not from the working directory. This means `INCLUDE 'lib/defs.asm'` inside `src/main.asm` looks for `src/lib/defs.asm`.
+
+**Nesting:** Files can include other files up to 16 levels deep. Circular includes (A includes B, B includes A) are detected and reported as errors.
+
+**JSON output:** When using `--agent` or `--run-source`, diagnostics, symbols, and listing entries include `"file"` and `"sourceLine"` fields so errors can be traced to their original source file. An `"includes"` array lists all files involved in the assembly.
+
+### Macros
+
+Define reusable code patterns with `MACRO`/`ENDM`. Macros are expanded as a text-level preprocessor step after `INCLUDE` expansion but before the two-pass assembler. The assembler pipeline is:
+
+```
+expandIncludes() → expandMacros() → two-pass assembly
+```
+
+The two-pass assembler sees only expanded code — macros are purely a text substitution layer.
+
+#### Named Macros with Parameters
+
+```asm
+PrintChar MACRO ch
+    MOV DL, ch
+    MOV AH, 02h
+    INT 21h
+ENDM
+
+PrintChar 'A'       ; expands to MOV DL,'A' / MOV AH,02h / INT 21h
+PrintChar 'B'
+```
+
+**Syntax:** `name MACRO [param1, param2, ...]` ... `ENDM`. The macro name appears *before* the `MACRO` keyword. Parameters are comma-separated identifiers after `MACRO`. Invoke by using the macro name as if it were an instruction.
+
+**Substitution rules:**
+- Case-insensitive: parameter `ch` matches `ch`, `CH`, `Ch` in the body
+- Word-boundary only: a parameter named `x` will **not** replace the `x` inside `AX` or `BX` — only standalone `x` tokens
+- Strings and comments are protected: `'x'` and `; x` are never substituted
+- Macro names themselves are case-insensitive: defining `Foo MACRO` means `foo`, `FOO`, `Foo` all invoke it
+
+**`&` concatenation:** The `&` operator joins parameter text with surrounding characters. The `&` is consumed during substitution:
+
+```asm
+MakeLabel MACRO name, num
+    name&num:
+        DB 0
+ENDM
+MakeLabel msg, 1    ; defines label msg1
+MakeLabel msg, 2    ; defines label msg2
+```
+
+#### LOCAL Labels
+
+Use `LOCAL` to declare labels that get unique names (`??0000`, `??0001`, ...) per expansion, avoiding duplicate-label errors:
+
+```asm
+Skip MACRO
+    LOCAL done
+    JMP done
+    NOP
+done:
+ENDM
+
+Skip    ; done → ??0000
+Skip    ; done → ??0001
+```
+
+`LOCAL` must appear before any instructions in the macro body. Multiple locals can be on one line: `LOCAL a, b, c`. The generated `??XXXX` labels are global and work in expressions like any other label.
+
+#### REPT — Repeat N Times
+
+```asm
+REPT 5
+    NOP
+ENDM
+```
+
+Count must be a **numeric literal** — decimal, hex (`0Ah`), binary (`100b`), or octal. EQU constants and expressions are not supported as the count; use a literal value. `REPT 0` is valid and emits nothing.
+
+REPT blocks can be nested:
+
+```asm
+REPT 3
+    REPT 2
+        NOP
+    ENDM
+ENDM
+; emits 6 NOPs
+```
+
+#### IRP — Iterate Over a List
+
+```asm
+IRP reg, <AX, BX, CX, DX>
+    PUSH reg
+ENDM
+; expands to: PUSH AX / PUSH BX / PUSH CX / PUSH DX
+```
+
+The list must be enclosed in angle brackets `<>`. Commas inside the list separate items. An empty list `<>` is valid and emits nothing.
+
+#### Nesting and Composition
+
+Macros can invoke other macros, and macro bodies can contain REPT and IRP blocks. All combinations work:
+
+```asm
+; Macro invoking another macro
+Inner MACRO val
+    MOV AL, val
+ENDM
+Outer MACRO x
+    Inner x
+ENDM
+Outer 42h           ; expands to MOV AL, 42h
+
+; IRP inside a macro body
+SaveRegs MACRO
+    IRP r, <AX, BX, CX, DX>
+        PUSH r
+    ENDM
+ENDM
+
+; REPT inside a macro body
+FillZero MACRO count
+    REPT count
+        DB 0
+    ENDM
+ENDM
+
+; Macro invocation inside REPT/IRP
+Emit MACRO val
+    DB val
+ENDM
+IRP v, <10h, 20h, 30h>
+    Emit v
+ENDM
+```
+
+Expansion iterates until stable, up to 10,000 iterations. Self-recursive or mutually-recursive macros will hit this limit and produce an error.
+
+A label before an invocation is preserved: `start: PrintChar 'A'` places the label on its own line, then the expansion.
+
+#### Restrictions
+
+- Macro names cannot shadow reserved words (instructions, registers, directives like `DUP`, `BYTE`, etc.)
+- Redefining a macro emits a warning; the new definition replaces the old one
+- Argument count mismatches emit warnings: missing args become empty strings, extras are ignored
+- REPT count must be a numeric literal, not a symbol or expression
+
+#### Source Map and Diagnostics
+
+All expanded lines inherit the source location of the invocation site, so assembler errors within a macro expansion point back to the line that invoked the macro. Comment markers (`; >>> MACRO name` / `; <<< END MACRO name`) delimit expansions visually.
+
+**Note:** Data directives (`DB`, `DW`) emitted by macro expansions are assembled normally but do not appear as individual entries in the JSON `listing` array. Verify data emission by checking the address gap between surrounding listing entries, or by running with `--run-source` and inspecting memory.
 
 ---
 
@@ -937,6 +1140,13 @@ Every diagnostic includes an actionable `hint` field. Read the hint first — it
 | `"Invalid operands for LEA"` | Wrong operand types for LEA | Example: `LEA DI, [BX+SI+10h]` |
 | `"Invalid IN/OUT operands"` | Wrong I/O operand combination | All valid IN or OUT forms |
 | `"Division by zero"` | Expression divides by zero | To check the divisor value or EQU constant |
+| `"Cannot define macro with reserved name 'X'"` | MACRO name shadows MOV, AX, DUP, etc. | Rename the macro to a non-reserved identifier |
+| `"MACRO 'X' without matching ENDM"` | Unclosed macro definition | Add `ENDM` after the macro body |
+| `"ENDM without matching MACRO, REPT, or IRP"` | Orphan ENDM | Remove the stray ENDM or add the missing opening directive |
+| `"REPT count must be a non-negative numeric literal"` | REPT with EQU constant, expression, or invalid token | Use a literal number (e.g., `5`, `0Ah`, `100b`), not a symbol |
+| `"REPT/IRP without matching ENDM"` | Unclosed repeat block | Add `ENDM` to close the block |
+| `"IRP directive missing angle-bracket list"` | IRP without `<...>` items | Use `IRP param, <item1, item2, ...>` syntax |
+| `"Macro expansion iteration limit exceeded"` | Recursive or mutually-recursive macros | The macro expands to itself endlessly; break the cycle |
 
 **Warnings** (assembly succeeds but something may be wrong):
 
@@ -950,6 +1160,8 @@ Every diagnostic includes an actionable `hint` field. Read the hint first — it
 | `"ORG directive after code"` | ORG used after code/data emitted | That ORG doesn't move code; place at start |
 | `"redefined"` | Label defined more than once | Previous definition line; suggests local labels |
 | `"Local label"` + `"outside procedure"` | `.label` used without enclosing PROC | To use PROC/ENDP or a global label |
+| `"Macro 'X' redefined"` | Macro defined twice | Previous definition line; second definition replaces first |
+| `"Macro 'X' invoked with N args, expected M"` | Argument count mismatch | Missing args become empty strings; extras are ignored |
 
 ### Verifying Correctness
 
@@ -1187,6 +1399,86 @@ hex_table: DB '0123456789ABCDEF'
 
 > **Note:** PUSHA saves the original SP value, but POPA discards it — SP is restored naturally by the 8 pops. PUSHA/POPA are 80186+ instructions (1 byte each vs 16 bytes for 8 individual PUSH/POP).
 
+### Macro: Save/Restore Specific Registers
+
+Use IRP inside a macro to push and pop a chosen set of registers:
+
+```asm
+SaveRegs MACRO
+    IRP r, <AX, BX, CX, DX>
+        PUSH r
+    ENDM
+ENDM
+
+RestoreRegs MACRO
+    IRP r, <DX, CX, BX, AX>
+        POP r
+    ENDM
+ENDM
+
+    SaveRegs
+    ; ... work ...
+    RestoreRegs
+```
+
+### Macro: Print a Character
+
+```asm
+PrintChar MACRO ch
+    MOV DL, ch
+    MOV AH, 02h
+    INT 21h
+ENDM
+
+NewLine MACRO
+    PrintChar 0Dh
+    PrintChar 0Ah
+ENDM
+
+    PrintChar 'H'
+    PrintChar 'i'
+    NewLine
+```
+
+### Macro: Define Data with Label
+
+```asm
+DefString MACRO name, text
+name:
+    DB text, '$'
+ENDM
+
+DefString greeting, 'Hello World!'
+
+    MOV AH, 09h
+    MOV DX, greeting
+    INT 21h
+```
+
+### Macro: Fill Memory with Non-Zero Value
+
+```asm
+; RESB fills with zeros; use REPT inside a macro for any value
+FillMem MACRO count, val
+    REPT count
+        DB val
+    ENDM
+ENDM
+
+buffer:
+FillMem 16, 0FFh    ; 16 bytes of FFh
+```
+
+### Macro: Power-of-Two Table via IRP
+
+```asm
+powers:
+IRP val, <01h, 02h, 04h, 08h, 10h, 20h, 40h, 80h>
+    DB val
+ENDM
+; powers is an 8-byte table: 1, 2, 4, 8, 16, 32, 64, 128
+```
+
 ---
 
 ## Emulator Internals
@@ -1240,15 +1532,15 @@ All program output is JSON-safe regardless of what bytes the program produces:
 
 ## Known Limitations
 
-1. **No linker.** This assembler produces flat binaries only. There is no object file output, no linking, and no support for multiple source files or `INCLUDE`.
+1. **No linker.** This assembler produces flat binaries only. There is no object file output and no linking. Multiple source files are supported via the `INCLUDE` directive.
 2. **No 32-bit mode.** Only 16-bit real-mode instructions are supported (8086/8088, with 80186 shift extensions).
 3. **No segment directives.** There is no `.code`, `.data`, `.stack`, or `SEGMENT`/`ENDS` support. All code and data share one flat segment.
-4. **No macro system.** No `MACRO`/`ENDM`, no `REPT`, no `IRP`. Use EQU for constants and PROC/ENDP for structuring.
+4. ~~No macro system.~~ **Resolved** — `MACRO`/`ENDM`, `LOCAL`, `REPT`, and `IRP` are now supported. See [Macros](#macros).
 5. **No `BYTE PTR` / `WORD PTR` syntax.** Use `BYTE` or `WORD` directly before the memory operand (e.g., `MOV BYTE [BX], 5`, not `MOV BYTE PTR [BX], 5`).
 6. **No 8086-strict mode.** The assembler will produce 80186 opcodes (C0h/C1h for shift-by-immediate) with a warning rather than rejecting them.
 7. **No floating-point (8087) instructions.**
 8. **Duplicate labels emit a warning.** Redefining a label overwrites the previous value but emits a `WARNING` diagnostic with the previous definition line.
-9. **No `TIMES` directive.** Use `RESB` for zero-fill or `DB` with comma-separated repeated values.
+9. **No `TIMES` directive.** Use `RESB` for zero-fill, `REPT N` / `DB val` / `ENDM` for non-zero fill, or `DB` with comma-separated repeated values.
 10. **Emulator: I/O ports not emulated.** `IN` and `OUT` instructions are logged as skipped.
 11. **Emulator: Limited DOS/BIOS interrupt support.** INT 20h, INT 21h (functions 01h, 02h, 06h, 09h, 2Ah, 2Ch, 30h, 4Ch), and INT 10h (functions 00h, 02h, 03h, 06h, 07h, 08h, 09h, 0Ah, 0Eh, 0Fh) are handled. INT 10h font services (AH=11h) are not implemented. Other interrupts are logged as skipped.
 12. **Emulator: No hardware interrupt simulation.** Timer, keyboard, and other hardware interrupts are not generated.
@@ -1283,6 +1575,21 @@ All diagnostics include an actionable `hint` field. For programmatic handling, p
 | `"PROC without label"` | PROC directive with no label | Example syntax |
 | `"Extra tokens"` | Stray content after instruction | Common causes |
 | `"Internal: mnemonic"` | Assembler bug: no encoder for ISA entry | To report the bug |
+| `"Cannot open include file"` | INCLUDE references a file that doesn't exist | The resolved path and base directory used for resolution |
+| `"Circular include detected"` | File A includes B which includes A (directly or indirectly) | The canonical path of the file already in the include chain |
+| `"Include nesting depth exceeded"` | INCLUDE chain deeper than 16 levels | To check for deeply nested or recursive chains |
+| `"INCLUDE directive missing filename"` | INCLUDE with no filename after it | Usage syntax examples |
+| `"Unterminated string in INCLUDE"` | Opening quote without matching close quote | The line containing the unterminated string |
+| `"Cannot define macro with reserved name"` | MACRO name shadows an instruction, register, or directive | — |
+| `"MACRO ... without matching ENDM"` | Macro definition has no closing ENDM | — |
+| `"ENDM without matching MACRO, REPT, or IRP"` | Orphan ENDM with no opening block | — |
+| `"REPT directive missing repeat count"` | REPT with no count argument | Usage syntax |
+| `"REPT count must be a non-negative numeric literal"` | REPT count is not a valid number | The invalid token |
+| `"REPT without matching ENDM"` | REPT block has no closing ENDM | — |
+| `"IRP directive missing parameter name"` | IRP with no parameter | Usage syntax |
+| `"IRP directive missing angle-bracket list"` | IRP without `<...>` item list | Usage syntax |
+| `"IRP without matching ENDM"` | IRP block has no closing ENDM | — |
+| `"Macro expansion iteration limit exceeded"` | Infinite or deeply recursive macro expansion | Check for recursive macros |
 
 ### Warnings (`level: "WARNING"`)
 
@@ -1296,6 +1603,8 @@ All diagnostics include an actionable `hint` field. For programmatic handling, p
 | `"ORG directive after code"` | ORG used after code/data emitted | That ORG doesn't move code; place at start |
 | `"redefined"` | Label defined more than once | Previous definition line; suggests local labels |
 | `"Local label"` + `"outside procedure"` | `.label` used without enclosing PROC | To use PROC/ENDP or a global label |
+| `"Macro ... redefined"` | Macro name defined more than once | Previous definition line |
+| `"Macro ... invoked with N args, expected M"` | Argument count mismatch on macro invocation | Whether missing args become empty or extras are ignored |
 
 ---
 
