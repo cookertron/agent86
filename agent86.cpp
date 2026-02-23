@@ -523,7 +523,7 @@ string findClosestSymbol(const map<string, SymbolInfo>& table, const string& tar
 
 // --- Expression Parser ---
 
-int parseExpression(AssemblerContext& ctx, const vector<Token>& tokens, int& idx, int minPrec = 0) {
+int parseExpression(AssemblerContext& ctx, const vector<Token>& tokens, int& idx, int minPrec = 0, bool insideBrackets = false) {
     if (idx >= tokens.size()) return 0;
 
     int lhs = 0;
@@ -532,12 +532,12 @@ int parseExpression(AssemblerContext& ctx, const vector<Token>& tokens, int& idx
     if (tokens[idx].type == TokenType::Plus || tokens[idx].type == TokenType::Minus) {
         TokenType opType = tokens[idx].type;
         idx++;
-        int val = parseExpression(ctx, tokens, idx, 100); // High precedence for unary
+        int val = parseExpression(ctx, tokens, idx, 100, insideBrackets); // High precedence for unary
         if (opType == TokenType::Minus) lhs = -val;
         else lhs = val;
     } else if (tokens[idx].type == TokenType::LParen) {
         idx++;
-        lhs = parseExpression(ctx, tokens, idx, 0);
+        lhs = parseExpression(ctx, tokens, idx, 0, insideBrackets);
         if (idx < tokens.size() && tokens[idx].type == TokenType::RParen) idx++;
         else logError(ctx, tokens[idx-1].line, "Expected ')'", "Check for unmatched parentheses in your expression.");
     } else if (tokens[idx].type == TokenType::Number) {
@@ -643,8 +643,19 @@ int parseExpression(AssemblerContext& ctx, const vector<Token>& tokens, int& idx
 
         if (prec < minPrec) break;
 
+        // Inside brackets, stop before +/- if the next token is a register name
+        // so the bracket loop can handle it as a base/index register
+        if (insideBrackets && (opType == TokenType::Plus || opType == TokenType::Minus)) {
+            if (idx + 1 < (int)tokens.size()) {
+                int dummyReg, dummySize;
+                if (isRegister(tokens[idx + 1].value, dummyReg, dummySize)) {
+                    break;
+                }
+            }
+        }
+
         idx++;
-        int rhs = parseExpression(ctx, tokens, idx, prec + 1);
+        int rhs = parseExpression(ctx, tokens, idx, prec + 1, insideBrackets);
         
         if (opType == TokenType::Plus) lhs += rhs;
         else if (opType == TokenType::Minus) lhs -= rhs;
@@ -769,7 +780,7 @@ Operand parseOperand(AssemblerContext& ctx, const vector<Token>& tokens, int& id
             } else {
                 // Parse as expression/number/label
                 ctx.encounteredSymbol = false; // Reset before expression
-                displacement += parseExpression(ctx, tokens, idx, 0); 
+                displacement += parseExpression(ctx, tokens, idx, 0, true);
                 if (ctx.encounteredSymbol) op.involvesSymbol = true;
             }
         }
