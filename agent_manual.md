@@ -64,14 +64,18 @@ agent86 --run hello.com
 | `--breakpoints <addr1,addr2,...>` | Set breakpoints at hex addresses (comma-separated). | None |
 | `--watch-regs <reg1,reg2,...>` | Watch registers for changes. Emits snapshots when watched registers change. | None |
 | `--max-cycles <N>` | Maximum CPU cycles before forced halt. | 1000000 |
-| `--input <string>` | Provide stdin input for the program (consumed by INT 21h/01h and 06h). | Empty |
+| `--input <string>` | Provide stdin input for the program (consumed by INT 21h/01h and 06h). Supports escapes: `\xHH`, `\0`, `\n`, `\r`, `\t`, `\\`, and `\S` (shift-held prefix — see [INT 16h](#int-16h--bios-keyboard-services)). | Empty |
 | `--mem-dump <addr,len>` | Include memory dump in breakpoint snapshots. Address in hex, length in decimal. | None |
 | `--screen` | **Capture full 80×50 screen** from VRAM into JSON output. | Off |
 | `--viewport <col,row,w,h>` | **Capture a rectangular region** of the screen. Implies `--screen` behavior but only for the specified window. | Off |
 | `--attrs` | **Include attribute bytes** in screen output. Emits `screenAttrs[]` alongside `screen[]`. | Off |
 | `--screenshot <file.bmp>` | **Render VRAM as a BMP image file.** Writes a 24-bit BMP using CP437 fonts with CGA 16-color palette. | Off |
 | `--font 8x8\|8x16` | **Select font size for screenshot.** `8x16` (default) produces 640x800, `8x8` produces 640x400. | 8x16 |
+| `--mouse <x>,<y>[,<buttons>]` | **Configure mouse state** for INT 33h emulation. `x`,`y` are pixel coordinates; `buttons` is a bitmask (1=left, 2=right, 4=middle, default 0). Presence enables the mouse driver. | Off |
+| `--events '<JSON>'` or `--events @file.json` | **Script a timeline of user interactions** triggered by interrupt call counts. JSON array of event objects. If any event includes a `mouse` action, the mouse driver is auto-enabled. See [Event Scripting](#event-scripting). | Off |
 | `--output-file <path>` | **Write JSON to file** instead of stdout. Bypasses shell encoding issues (no BOM, no re-encoding). | stdout |
+| `--vram-fill [text]` | **Pre-fill VRAM with known content** before the program runs. With a text argument, tiles the string across all 4000 character cells (80×50). Without an argument, fills with random printable characters. Attribute bytes are left at default (`07h`). Useful for seeing which cells a program actually writes to. | Off |
+| `--dos-root <dir>` | **Mount a host directory** as DOS filesystem root (C:\). Enables file I/O (open/read/write/close) and directory operations (FindFirst/FindNext, chdir). All paths sandboxed within this directory. | Off |
 
 ### Flag Usage Patterns
 
@@ -151,6 +155,52 @@ agent86 --run-source life.asm --screenshot screen.bmp --font 8x8
 agent86 --run-source life.asm --screen --output-file result.json
 ```
 
+**Pre-fill VRAM with a repeating pattern to see which cells a program writes to:**
+```bash
+agent86 --run-source game.asm --vram-fill "ABCD" --screen
+```
+
+**Pre-fill VRAM with random characters (no argument):**
+```bash
+agent86 --run-source game.asm --vram-fill --screen
+```
+
+**Run a mouse-driven program with initial mouse state:**
+```bash
+agent86 --run-source menu.asm --mouse 320,100,1
+```
+
+**Script coordinated keyboard and mouse interactions:**
+```bash
+agent86 --run-source app.asm --events '[{"on":"poll:3","mouse":[320,100,1]},{"on":"read:1","keys":"Y"}]'
+```
+
+**Load events from a file (useful for complex scripts):**
+```bash
+agent86 --run-source app.asm --events @events.json
+```
+
+**Provide shifted keys (for INT 16h/02h shift detection):**
+```bash
+agent86 --run-source arrows.asm --input "\S\x00\S\x4B"
+```
+
+**Mount a host directory for DOS file I/O:**
+```bash
+agent86 --run-source filetest.asm --dos-root ./testdir
+```
+
+**Read a file and observe I/O stats:**
+```bash
+agent86 --run-source reader.asm --dos-root /path/to/files
+```
+The JSON output will include a `fileIO` object with operation counts.
+
+**Combine file I/O with debugging:**
+```bash
+agent86 --run-source fileapp.asm --dos-root ./data --breakpoints 0120,0140 --watch-regs AX,BX
+```
+
 ---
 
 ## JSON Output Schema (`--agent`)
@@ -163,10 +213,10 @@ Every `--agent` invocation produces a single JSON object on stdout with this str
 
   "diagnostics": [
     {
-      "level": "ERROR",
+      "level": "WARNING",
       "line": 5,
-      "msg": "Conditional jump out of range (-200)",
-      "hint": "Displacement is -200 bytes (range: -128 to +127). Restructure as: JNZ .skip / JMP target / .skip:"
+      "msg": "Size mismatch between operands",
+      "hint": "Op1 is 8-bit (AL), Op2 is 16-bit (BX). Both operands must be the same width."
     }
   ],
 
@@ -299,6 +349,7 @@ If assembly fails, the `emulation` section will have `success: false` with no me
 - `flags`: Flags register as hex string.
 - `flagBits` (in `--run` mode): Individual flag values as booleans: CF, PF, AF, ZF, SF, OF, DF, IF.
 - `cursor`: VRAM cursor position as `{"row": N, "col": N}`. Always present. Tracks where INT 10h teletype output will write next.
+- `mouse` *(only when `--mouse` or `--events` with mouse actions is used)*: `{"x": N, "y": N, "buttons": N, "visible": bool}`. Final mouse driver state.
 
 **`screen[]`** — *(Only present when `--screen` or `--viewport` is used.)* Array of strings, one per row. Each string contains the visible text characters from the VRAM viewport. Non-printable bytes are replaced with `.` for clean JSON. Without `--screen`/`--viewport`, this field is omitted entirely to keep output compact.
 
@@ -312,6 +363,32 @@ If assembly fails, the `emulation` section will have `success: false` with no me
 
 **`diagnostics[]`** — Runtime diagnostics (e.g., output truncation warnings). Distinct from assembly diagnostics.
 
+**`events`** — *(Only present when `--events` is used.)* Object with event scripting results:
+- `total`: Number of events defined.
+- `fired`: Number of events that triggered during execution.
+- `pending`: Number of events that never triggered (program exited first).
+- `log[]`: Array of fired events, each with `on` (trigger string), `cycle` (when it fired), and `action` (human-readable summary).
+
+**`fileIO`** — *(Only present when `--dos-root` is used and file operations occurred.)* Object with file I/O statistics:
+- `filesOpened`: Number of files opened (AH=3Ch, 3Dh).
+- `filesClosed`: Number of files closed (AH=3Eh).
+- `bytesRead`: Total bytes read from files (AH=3Fh on file handles, not device handles).
+- `bytesWritten`: Total bytes written to files (AH=40h on file handles, not device handles).
+- `dirSearches`: Number of FindFirst calls (AH=4Eh).
+- `errors`: Number of failed file operations (CF=1 returns).
+
+Example:
+```json
+"fileIO": {
+  "filesOpened": 2,
+  "filesClosed": 2,
+  "bytesRead": 128,
+  "bytesWritten": 0,
+  "dirSearches": 1,
+  "errors": 0
+}
+```
+
 ---
 
 ## JSON Output Schema (`--run`)
@@ -321,10 +398,13 @@ The `--run` flag runs a pre-compiled `.COM` binary. The JSON output is the same 
 - `finalState.sregs`: Segment registers (ES, CS, SS, DS) as hex strings.
 - `finalState.flagBits`: Individual flags as booleans.
 - `finalState.cursor`: VRAM cursor position as `{"row": N, "col": N}`.
+- `finalState.mouse` *(only when `--mouse` or `--events` with mouse actions is used)*: `{"x": N, "y": N, "buttons": N, "visible": bool}`.
 - `snapshots[]`: Breakpoint and watchpoint snapshots (see Breakpoints section).
 - `screen[]`: Screen text (when `--screen` or `--viewport` is used).
 - `screenAttrs[]`: Attribute hex strings (when `--attrs` is also used).
 - `screenshot`: Path to rendered BMP file (when `--screenshot` is used and the file was written successfully).
+- `events` *(only when `--events` is used)*: Object with `total`, `fired`, `pending`, and `log[]`. See [Event Scripting](#event-scripting).
+- `fileIO` *(only when `--dos-root` is used and file operations occurred)*: Object with `filesOpened`, `filesClosed`, `bytesRead`, `bytesWritten`, `dirSearches`, and `errors`. See [Emulation Field Reference](#emulation-field-reference).
 
 ---
 
@@ -563,11 +643,15 @@ All shift and rotate instructions accept both register and memory destinations. 
 **Unconditional:**
 | Instruction | Encoding | Range |
 |---|---|---|
-| `JMP` | Near (E9, 3 bytes) | Full 16-bit range |
-| `CALL` | Near (E8, 3 bytes) | Full 16-bit range |
+| `JMP label` | Near (E9, 3 bytes) | Full 16-bit range |
+| `JMP reg16` | Indirect (FF /4, 2 bytes) | Any address in register (e.g., `JMP BX`) |
+| `JMP mem16` | Indirect (FF /4, 2-4 bytes) | Any address in memory (e.g., `JMP [BX+2]`, `JMP WORD [table]`) |
+| `CALL label` | Near (E8, 3 bytes) | Full 16-bit range |
+| `CALL reg16` | Indirect (FF /2, 2 bytes) | Any address in register (e.g., `CALL BX`) |
+| `CALL mem16` | Indirect (FF /2, 2-4 bytes) | Any address in memory (e.g., `CALL [BX]`, `CALL WORD [vtable+SI]`) |
 | `RET` | C3 (1 byte) | Returns to caller |
 
-**Conditional (all short jumps, 2 bytes, range: -128 to +127 bytes):**
+**Conditional (short form 2 bytes; auto-promoted to 5 bytes when target exceeds short range):**
 
 | Mnemonic(s) | Condition | Flag Test |
 |---|---|---|
@@ -596,7 +680,7 @@ All shift and rotate instructions accept both register and memory destinations. 
 | `LOOPNE` / `LOOPNZ` | Decrement CX; jump if CX!=0 AND ZF=0 | Short |
 | `JCXZ` | Jump if CX=0 (no decrement) | Short |
 
-> **Critical range limitation:** All conditional jumps and loops are short-range only (-128 to +127 bytes from the *end* of the instruction). If you get a "jump out of range" error, restructure your code by inverting the condition and using a near JMP. For example, replace `JZ far_label` with: `JNZ .skip` / `JMP far_label` / `.skip:`
+> **Automatic near-jump promotion:** Conditional jumps whose targets exceed the short range (-128 to +127 bytes) are automatically promoted to a near form. The assembler emits an inverted condition that skips over a 3-byte near JMP, making this transparent. No manual restructuring is needed. LOOP/LOOPZ/LOOPNZ/JCXZ are NOT auto-promoted; use `DEC CX` / `JNZ` for far loop targets.
 
 ### String Instructions
 | Instruction | Operation |
@@ -687,24 +771,314 @@ The attribute byte at each VRAM cell controls foreground and background color:
 
 Common attribute values: `07h` = light grey on black (default), `1Fh` = white on blue, `4Eh` = yellow on red, `0Fh` = bright white on black.
 
+### INT 16h — BIOS Keyboard Services
+
+| AH | Function | Behavior |
+|---|---|---|
+| `02h` | Get shift flags | Returns the current shift-flags byte in AL. |
+
+**Shift-flags byte (AL):**
+
+| Bit | Meaning |
+|-----|---------|
+| 0 | Right Shift held |
+| 1 | Left Shift held |
+| 2 | Ctrl held (not yet emulated) |
+| 3 | Alt held (not yet emulated) |
+| 4–7 | Lock states (not emulated) |
+
+**How shift state is driven:**
+
+The emulator tracks a `shiftFlags` byte that is set by a `\S` prefix in the `--input` string (or event `keys`). When `\S` precedes a byte in the input stream, that byte is delivered with Left Shift (bit 1) set. The shift state persists after key consumption, so a program that reads a key via INT 21h/06h and then immediately calls INT 16h/02h will see the correct flags.
+
+- **Single-byte shifted key:** `\SA` — delivers `'A'` with shift held.
+- **Extended shifted key (two bytes):** `\S\x00\S\x4B` — delivers the extended-key pair `00h, 4Bh` (Left arrow) with shift held for both reads.
+- **Unshifted key:** any byte not preceded by `\S` clears the shift flags.
+
+> **Common pattern — detect Shift+arrow:**
+> ```asm
+> MOV AH, 06h
+> MOV DL, 0FFh
+> INT 21h              ; Read first byte (00h for extended key)
+> JZ no_key
+> CMP AL, 0
+> JNE not_extended
+> MOV AH, 06h
+> MOV DL, 0FFh
+> INT 21h              ; Read scan code
+> ; Now check shift state
+> MOV AH, 02h
+> INT 16h              ; AL = shift flags
+> AND AL, 03h          ; Isolate Shift bits
+> JNZ shifted_arrow
+> ```
+
 ### INT 20h — Program Terminate
 
 Halts emulation with `exitCode: 0`. This is the standard .COM termination method. A program that returns with an empty stack (RET when SP=FFFEh) will execute the `INT 20h` at address 0000h (placed there by the emulator as a PSP stub).
 
 ### INT 21h — DOS Function Calls
 
+The emulator implements 28 INT 21h functions organized into four categories: console I/O, system information, file handle I/O, and directory operations. Any unimplemented AH value is logged in `skipped[]` as `"Unimplemented DOS function"`.
+
+#### Console I/O Functions
+
 | AH | Function | Behavior |
 |---|---|---|
 | `01h` | Read character with echo | Reads one byte from `--input` string (or 0Dh if exhausted). Returns in AL. Echoes to output. |
 | `02h` | Write character | Writes DL to output buffer. |
 | `06h` | Direct console I/O | If DL=FFh: reads input (ZF=0 and AL=char if available, ZF=1 if not). Otherwise: writes DL to output. |
-| `09h` | Write $-terminated string | Reads bytes from DS:DX until `$` terminator. Writes to output buffer. **Capped at 4096 bytes** with diagnostic if truncated (possible bad pointer). |
-| `2Ah` | Get date (stub) | Returns CX=year, DH=month, DL=day, AL=day-of-week. |
-| `2Ch` | Get time (stub) | Returns CH=hour, CL=minute, DH=second, DL=centisecond. |
-| `30h` | Get DOS version (stub) | Returns AL=5 (major), AH=0 (minor). |
-| `4Ch` | Exit with return code | Halts emulation with `exitCode` = AL. |
+| `09h` | Write $-terminated string | Reads bytes from DS:DX until `$` terminator. Writes to output buffer. **Capped at 4096 bytes**. |
 
-Any other AH value is logged in `skipped[]` as `"Unimplemented DOS function"`.
+#### System Functions
+
+| AH | Function | Behavior |
+|---|---|---|
+| `0Eh` | Select disk | Sets current drive to DL (0=A, 2=C). Returns AL=26 (total drives). |
+| `19h` | Get current disk | Returns current drive in AL (default=2, i.e. C:). |
+| `1Ah` | Set DTA | Sets Disk Transfer Area address to DS:DX for FindFirst/FindNext. |
+| `25h` | Set interrupt vector | Stub — silently ignored. Programs often set INT 24h (critical error handler); this is safely ignored. |
+| `2Ah` | Get date | Returns CX=year, DH=month, DL=day, AL=day-of-week. Uses real system date. |
+| `2Ch` | Get time | Returns CH=hour, CL=minute, DH=second, DL=centisecond. Uses real system time. |
+| `2Fh` | Get DTA | Returns DTA address in ES:BX. Default is PSP:0080h. |
+| `30h` | Get DOS version | Returns AL=5 (major), AH=0 (minor). Reports as DOS 5.0. |
+| `35h` | Get interrupt vector | Stub — returns ES:BX=0000:0000. |
+| `62h` | Get PSP segment | Returns BX=0 (PSP segment base). |
+
+#### File Handle I/O Functions
+
+These functions operate on file handles. Handles 0–4 are pre-allocated device handles that work without `--dos-root`. File handles 5+ require `--dos-root` to be set.
+
+| AH | Function | Behavior |
+|---|---|---|
+| `3Ch` | Create file | Creates/truncates file at DS:DX path. CX=attributes (ignored). Returns handle in AX. CF=1 on error. Requires `--dos-root`. |
+| `3Dh` | Open file | Opens file at DS:DX path. AL=mode (0=read, 1=write, 2=read/write). Returns handle in AX. CF=1 if not found. Requires `--dos-root`. |
+| `3Eh` | Close file | Closes handle in BX. Closing device handles (0–4) is a silent no-op. CF=1 if invalid handle. |
+| `3Fh` | Read file/device | Reads CX bytes from handle BX into buffer at DS:DX. Returns AX=bytes actually read. Returns AX=0 at EOF. CF=1 on error. |
+| `40h` | Write file/device | Writes CX bytes from buffer at DS:DX to handle BX. Returns AX=bytes written. CF=1 on error. |
+| `42h` | Seek (lseek) | Repositions file pointer for handle BX. AL=origin (0=SEEK_SET, 1=SEEK_CUR, 2=SEEK_END). CX:DX=32-bit offset (CX=high, DX=low). Returns new position in DX:AX. CF=1 on error. On device handles, returns DX:AX=0 without error. |
+| `43h` | Get/set file attributes | AL=0: get file attributes into CX. AL=1: set attributes (stub, returns success). CF=1 if file not found. Requires `--dos-root`. |
+| `44h/00` | IOCTL get device info | Returns device information word in DX for handle BX. Bit 7 set = character device. Bit 7 clear = file (bits 5:0 = drive number). CF=1 if invalid handle. |
+| `57h` | Get file date/time | AL=0: get file modification time/date for handle BX. Returns CX=packed time, DX=packed date. CF=1 on error. |
+| `4Ch` | Exit with return code | Halts emulation. `exitCode` = AL. |
+
+#### Device Handle Table
+
+Handles 0–4 are always available, even without `--dos-root`:
+
+| Handle | Device | Read behavior | Write behavior |
+|--------|--------|---------------|----------------|
+| 0 | STDIN | Reads from `--input` buffer (byte-by-byte). Returns 0 bytes at end of input. | Writes to stdout capture (same as handle 1). |
+| 1 | STDOUT | Returns 0 bytes (not readable). | Appends to `output` / VRAM display. |
+| 2 | STDERR | Returns 0 bytes (not readable). | Appends to `output` / VRAM display. |
+| 3 | AUX | Returns 0 bytes. | Silently discarded. |
+| 4 | PRN | Returns 0 bytes. | Silently discarded. |
+
+Writing to handles 1 or 2 via AH=40h produces the same output as AH=02h or AH=09h — bytes appear in both the `output` field and the VRAM display.
+
+#### Directory Operations
+
+| AH | Function | Behavior |
+|---|---|---|
+| `3Bh` | Change directory | Changes current DOS directory to path at DS:DX. CF=1 (AX=3) if directory not found. Requires `--dos-root`. |
+| `47h` | Get current directory | Writes current directory path to buffer at DS:SI. No leading backslash, null-terminated. DL=drive (0=current). Returns empty string at root. |
+| `4Eh` | FindFirst | Finds first file matching wildcard pattern at DS:DX (e.g., `*.*`, `*.TXT`). CX=attribute mask (set bit 4 / 10h to include subdirectories). Writes result to DTA. CF=1 (AX=18) if no match. Requires `--dos-root`. |
+| `4Fh` | FindNext | Finds next file from previous FindFirst search. Writes result to DTA. CF=1 (AX=18) when no more files. Check DTA byte at offset 15h for the entry's attribute (10h = directory). |
+
+#### DOS Error Convention
+
+All file and directory functions use the carry flag (CF) to signal errors:
+- **CF=0**: Success. Return values are in the documented registers (AX, CX, DX, etc.).
+- **CF=1**: Failure. AX contains the DOS error code.
+
+| AX Error Code | Meaning |
+|---|---|
+| 1 | Invalid function |
+| 2 | File not found |
+| 3 | Path not found |
+| 5 | Access denied |
+| 6 | Invalid handle |
+| 18 | No more files (FindNext exhausted) |
+
+When `--dos-root` is not set, all file/directory functions (3Bh–4Fh) return CF=1, AX=2 (file not found). Console I/O and system functions work regardless.
+
+#### Path Sandboxing
+
+All file paths are resolved relative to the `--dos-root` directory. The emulator enforces strict sandboxing:
+
+1. **Drive letters are stripped**: `C:\FILE.TXT` becomes `FILE.TXT` relative to the root.
+2. **Backslashes are normalized**: `SUBDIR\FILE.TXT` is converted to forward slashes internally.
+3. **Relative paths use the current directory**: After `AH=3Bh` changes to `SUBDIR`, opening `FILE.TXT` resolves to `<dos-root>/SUBDIR/FILE.TXT`.
+4. **Directory traversal is blocked**: Paths containing `..` that would escape the root directory are rejected with error 3 (path not found). For example, `..\..\etc\passwd` cannot escape the sandbox.
+5. **Canonical path validation**: The resolved host path is checked against the canonical root path to ensure containment.
+
+#### Disk Transfer Area (DTA)
+
+FindFirst (AH=4Eh) and FindNext (AH=4Fh) write results to the Disk Transfer Area, a 43-byte buffer in the program's memory. The default DTA is at PSP offset 0080h. Programs can relocate it with AH=1Ah.
+
+**DTA layout (43 bytes):**
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 00h | 21 | Reserved (emulator stores search state ID) |
+| 15h | 1 | File attribute byte |
+| 16h | 2 | File time (packed, little-endian) |
+| 18h | 2 | File date (packed, little-endian) |
+| 1Ah | 4 | File size in bytes (little-endian DWORD) |
+| 1Eh | 13 | Filename in 8.3 format, null-terminated (ASCIIZ) |
+
+**Packed DOS time format** (16-bit word at offset 16h):
+```
+Bits 15-11: Hours (0-23)
+Bits 10-5:  Minutes (0-59)
+Bits 4-0:   Seconds / 2 (0-29)
+```
+
+**Packed DOS date format** (16-bit word at offset 18h):
+```
+Bits 15-9: Year - 1980 (0-127)
+Bits 8-5:  Month (1-12)
+Bits 4-0:  Day (1-31)
+```
+
+#### FindFirst Attribute Mask (CX)
+
+The CX register in FindFirst controls which entry types are returned:
+
+| CX Value | Entries Returned |
+|----------|-----------------|
+| `00h` | Normal files only (default). Subdirectories are excluded. |
+| `10h` | Normal files **and** subdirectories. Check attribute byte at DTA offset 15h — `10h` means directory, `20h` means file. |
+| `02h` | Normal files and hidden files. |
+| `16h` | All: normal + hidden + directories. |
+
+CX is a bitmask — set bit 4 (10h) to include directories, bit 1 (02h) for hidden files. Normal files are always returned regardless of CX.
+
+#### Wildcard Matching
+
+FindFirst pattern matching follows DOS conventions:
+
+| Pattern | Matches |
+|---------|---------|
+| `*.*` | **All entries** — files and directories, with or without extensions. This is the "match everything" pattern. |
+| `*.TXT` | Only entries with a `.TXT` extension. Does **not** match names without extensions. |
+| `DATA.*` | `DATA.BIN`, `DATA.TXT`, and also `DATA` (no extension). |
+| `FILE?.TXT` | `FILE1.TXT`, `FILEA.TXT`, etc. `?` matches exactly one character. |
+| `*` | All entries (equivalent to `*.*`). |
+
+Filenames are matched in 8.3 uppercase format. Host filenames longer than 8+3 characters are truncated. The pattern is case-insensitive.
+
+#### File I/O JSON Output
+
+When `--dos-root` is used and file operations occur, the JSON output includes a `"fileIO"` object:
+
+```json
+"fileIO": {
+  "filesOpened": 2,
+  "filesClosed": 2,
+  "bytesRead": 256,
+  "bytesWritten": 64,
+  "dirSearches": 1,
+  "errors": 0
+}
+```
+
+Use `fileIO.errors` to check if any operations failed. Use `bytesRead`/`bytesWritten` to verify data transfer amounts. `dirSearches` counts FindFirst calls.
+
+### INT 33h — Mouse Services
+
+Enabled by the `--mouse` CLI flag or by `--events` with any `mouse` action. When neither is specified, INT 33h function 0000h returns AX=0 (driver not installed) and all other functions are no-ops. INT 33h dispatches on the full AX register, not just AH.
+
+| AX | Function | Behavior |
+|---|---|---|
+| `0000h` | Reset / detect | Returns AX=FFFFh (installed), BX=3 (buttons). Resets position to center, clears button counters. |
+| `0001h` | Show cursor | Sets cursor visible flag (reported in `finalState.mouse.visible`). |
+| `0002h` | Hide cursor | Clears cursor visible flag. |
+| `0003h` | Get position & buttons | Returns BX=buttons, CX=x, DX=y. This is the primary polling function. |
+| `0004h` | Set position | CX=x, DX=y. Clamped to current range. |
+| `0005h` | Get button press info | BX=button index → BX=press count (reset after read), AX=buttons, CX=x, DX=y. |
+| `0006h` | Get button release info | Same as 0005h but for releases. |
+| `0007h` | Set horizontal range | CX=min, DX=max. Clamps current position. |
+| `0008h` | Set vertical range | CX=min, DX=max. Clamps current position. |
+| `000Bh` | Get motion counters | Returns CX=0, DX=0 (mickeys not tracked). |
+| `000Ch` | Set event handler | Silently ignored (no callback support). |
+
+**Example — read mouse position:**
+```asm
+ORG 100h
+    MOV AX, 3       ; Function 03h: get position & buttons
+    INT 33h          ; BX=buttons, CX=x, DX=y
+    INT 20h
+```
+
+Run with: `agent86 --run-source mouse.asm --mouse 320,100,1`
+
+### Event Scripting
+
+The `--events` flag scripts a timeline of user interactions — keyboard input, mouse state changes, and snapshots — triggered by what the program does. This enables testing interactive programs that interleave keyboard and mouse interaction (menus, dialogs, drawing tools) that can't be tested with static `--input` and `--mouse` alone.
+
+**Format:** A JSON array of event objects, passed inline or from a file:
+
+```bash
+agent86 --run-source app.asm --events '[{"on":"poll:3","mouse":[320,100,1]},{"on":"read:1","keys":"Y"}]'
+agent86 --run-source app.asm --events @events.json
+```
+
+**Trigger types** — each event fires once when the counter reaches the specified value:
+
+| Trigger | Meaning |
+|---------|---------|
+| `read:N` | Nth INT 21h keyboard read (AH=01h or AH=06h/DL=FFh). Fires before the read, so injected keys are available immediately. |
+| `poll:N` | Nth INT 33h/0003h mouse position poll. Fires before the poll returns, so the program sees the new state. |
+| `tick:N` | After the Nth CPU cycle (instruction). |
+| `int21:N` | Nth INT 21h call (any function). |
+| `int33:N` | Nth INT 33h call (any function, after driver is installed). |
+
+**Action types** — each event can combine multiple actions:
+
+| Key | Value | Effect |
+|-----|-------|--------|
+| `mouse` | `[x, y, buttons]` | Set mouse position and button state. Auto-enables the mouse driver. |
+| `keys` | `"string"` | Inject bytes into the keyboard buffer. Supports `\xHH`, `\n`, `\r`, `\t`, `\0`, `\\`, and `\S` (shift prefix) escapes. |
+| `snapshot` | `true` | Capture a CPU/memory snapshot (appears in the `snapshots` array). |
+
+**Semantics:**
+- Events fire once (never re-trigger).
+- `read` and `poll` triggers fire **inside** the interrupt handler, so injected state is available to the current read/poll — a `read:1` event with `keys` makes those keys available for the 1st read itself.
+- `tick`, `int21`, and `int33` triggers fire after each cycle in the main loop.
+- `--events` is composable with `--input` and `--mouse` (events can override mouse state set by `--mouse`; event-injected keys are inserted at the current read position in the `--input` buffer).
+
+**JSON output** — when events are used, the output includes an `events` object:
+```json
+"events": {
+  "total": 2,
+  "fired": 2,
+  "pending": 0,
+  "log": [
+    {"on": "poll:3", "cycle": 5, "action": "mouse [320,100,1]"},
+    {"on": "read:1", "cycle": 8, "action": "keys \"Y\""}
+  ]
+}
+```
+
+**Example — scripting a mouse-driven menu:**
+```json
+[
+  {"on": "poll:3",  "mouse": [320, 100, 1], "snapshot": true},
+  {"on": "poll:8",  "mouse": [320, 100, 0]},
+  {"on": "read:1",  "keys": "Y"},
+  {"on": "tick:5000", "snapshot": true}
+]
+```
+This clicks at (320,100) on the 3rd mouse poll (with snapshot), releases on the 8th, types "Y" on the first keyboard read, and captures a late snapshot at cycle 5000 if execution reaches that point.
+
+**Workflow for debugging interactive programs:**
+
+1. Run with `--events` to script the interaction sequence.
+2. Check `events.fired` vs `events.total` — if events are `pending`, the program exited before reaching those triggers.
+3. Add `"snapshot": true` to key events to capture CPU state at the moment of interaction.
+4. Combine with `--screen` to see the visual state when each event fires.
+5. Use `read:N` triggers to answer prompts and `poll:N` triggers to simulate mouse clicks at the right moment in the program's polling loop.
 
 ---
 
@@ -727,6 +1101,38 @@ Any other AH value is logged in `skipped[]` as `"Unimplemented DOS function"`.
 | `LOCAL` | `LOCAL lab1, lab2` | Declare labels inside a MACRO body that get unique names (`??XXXX`) per expansion. Must appear before any instructions in the macro body. |
 | `REPT` | `REPT 5` | Repeat the enclosed block N times. Count must be a non-negative numeric literal. |
 | `IRP` | `IRP reg, <AX,BX,CX>` | Iterate: expand the body once for each item in the angle-bracket list, substituting the parameter. |
+| `STRUC` | `name STRUC` | Begin a named structure definition. Fields are declared with `DB`, `DW`, `DD`, `RESB`, or `RESW`. No code is emitted; field offsets are calculated automatically and added to the symbol table as `name.field`. |
+| `ENDS` | `name ENDS` | End the current structure definition. The structure's total size is defined as a constant with the structure's name. |
+
+### STRUC/ENDS — Structure Definitions
+
+Define named data structures with automatic field offset calculation (MASM-compatible).
+
+```asm
+; Definition — no code emitted, creates offset constants
+POINT STRUC
+    X  DW  0          ; POINT.X = 0, default = 0
+    Y  DW  0          ; POINT.Y = 2, default = 0
+POINT ENDS            ; POINT = 4 (total size)
+```
+
+**Field types:** `DB` (1 byte), `DW` (2 bytes), `DD` (4 bytes), `RESB n` (n bytes), `RESW n` (n*2 bytes).
+
+**Using offsets in expressions:**
+```asm
+MOV AX, [BX + POINT.X]    ; access field at offset 0
+MOV CX, [BX + POINT.Y]    ; access field at offset 2
+ADD BX, POINT              ; advance pointer by struct size
+```
+
+**Instance allocation with angle-bracket overrides:**
+```asm
+pt1 POINT <100, 200>      ; emits DW 100, DW 200
+pt2 POINT <>               ; emits defaults (DW 0, DW 0)
+pt3 POINT <10>             ; partial: X=10, Y=default
+```
+
+Skipped fields in angle brackets use defaults: `<10, , 30>` overrides the first and third fields, keeping the second at its default.
 
 ### INCLUDE Directive
 
@@ -1100,6 +1506,63 @@ agent86 --run-source life.asm --screen --breakpoints 0150 --output-file frames.j
 
 Each snapshot in the JSON contains independent `screen[]` and `cursor` data, so you can diff consecutive snapshots to see exactly what changed between frames.
 
+**Identifying untouched cells with `--vram-fill`:** If you want to see exactly which screen cells a program writes to (vs. which remain at their initial state), pre-fill VRAM with a known pattern:
+
+```bash
+agent86 --run-source game.asm --vram-fill "." --screen
+```
+
+Any cell still showing `.` in the `screen[]` output was never written by the program. Using a repeating multi-character string like `"ABCD"` makes it even easier to spot partial overwrites. Without an argument, `--vram-fill` uses random characters, which is useful for detecting programs that assume VRAM starts blank.
+
+### Debugging Interactive Programs with Events
+
+For programs that require coordinated keyboard and mouse input (menus, dialogs, drawing tools), use `--events` to script a timeline of interactions:
+
+```bash
+# Click a button, then type a response
+agent86 --run-source menu.asm --events '[
+  {"on":"poll:5","mouse":[320,100,1],"snapshot":true},
+  {"on":"poll:10","mouse":[320,100,0]},
+  {"on":"read:1","keys":"Y"}
+]' --screen
+```
+
+**Strategy for building event scripts:**
+
+1. **First run** — Run with no events and check `events.log` output or `haltReason`. If the program is waiting for keyboard input, it will hit the cycle limit or read a default `0Dh`.
+2. **Add keyboard events** — Use `read:N` triggers to inject keys at each read point. Start with `read:1`, `read:2`, etc.
+3. **Add mouse events** — Use `poll:N` triggers to change mouse position/buttons at the right polling points. The program sees the new state on that exact poll.
+4. **Add snapshots** — Attach `"snapshot": true` to events at moments you want to inspect CPU/memory/screen state.
+5. **Check `events.pending`** — If events remain pending, the program exited before reaching those triggers. Adjust trigger counts or add more input.
+6. **Iterate** — Refine the timeline based on what the program does at each step.
+
+### Debugging File I/O Programs
+
+For programs that use INT 21h file operations (open, read, write, seek, directory listing), use `--dos-root` and inspect the `fileIO` stats:
+
+```
+1.  Create a test directory with the files your program expects
+2.  Run:  agent86 --run-source fileapp.asm --dos-root ./testdir
+3.  Parse the JSON output
+4.  Check emulation.exitCode — non-zero usually means a file operation failed
+5.  Check emulation.fileIO:
+      a. filesOpened matches expected count
+      b. bytesRead/bytesWritten match expected transfer sizes
+      c. errors == 0 (no failed operations)
+6.  If exitCode is non-zero:
+      a. Add --breakpoints before and after INT 21h calls
+      b. Check CF (carry flag) in the flags register after each INT 21h
+      c. If CF=1, check AX for the DOS error code (2=file not found, 3=path not found, 6=bad handle)
+7.  For FindFirst/FindNext issues:
+      a. Check that the DTA is set up (AH=1Ah) before AH=4Eh
+      b. Verify the wildcard pattern (e.g., *.*, *.TXT) in DS:DX
+      c. Check fileIO.dirSearches to confirm FindFirst was called
+8.  For read/write issues:
+      a. Verify the handle in BX is valid (returned by AH=3Ch or 3Dh)
+      b. Check AX after read/write — it contains actual bytes transferred
+      c. AX=0 on read means EOF was reached
+```
+
 ### Diagnosing Garbage Output
 
 If the program output looks wrong (garbled, too short, or empty):
@@ -1121,7 +1584,7 @@ Every diagnostic includes an actionable `hint` field. Read the hint first — it
 | `"Undefined label X"` with hint `"Did you mean 'Y'?"` | Typo in label name | The closest matching symbol and its definition line |
 | `"Undefined label X"` with hint about registers | Register used in expression | That registers can't appear in arithmetic expressions |
 | `"Undefined label X"` with hint about local labels | `.label` used outside PROC | To wrap code in PROC/ENDP or use a global label |
-| `"Conditional jump out of range (N)"` | Target too far for short jump | The exact inverted condition and restructure pattern (e.g., `JNZ .skip / JMP target / .skip:`) |
+| `"Conditional jump auto-promoted"` | Jcc target exceeded short range; assembler auto-emitted inverted-Jcc + near JMP (5 bytes) | The expanded encoding details (INFO-level, not an error) |
 | `"Loop jump out of range (N)"` | Loop body exceeds 127 bytes | The `DEC CX / JNZ target` replacement pattern |
 | `"Size mismatch between operands"` | Mixing 8-bit and 16-bit registers | Both operand names and sizes (e.g., "Op1 is 8-bit (AL), Op2 is 16-bit (BX)") |
 | `"Stack ops require 16-bit register"` | `PUSH AL` or similar | The specific 16-bit counterpart to use (e.g., "Use AX instead") |
@@ -1185,36 +1648,13 @@ agent86 --explain IMUL
 
 This returns all valid operand forms and any constraints. Use this to avoid trial-and-error assembly cycles.
 
-### Working with Conditional Jump Limits
+### Conditional Jump Auto-Promotion
 
-Conditional jumps are limited to -128 to +127 bytes. When planning loops or branching over large code blocks, calculate byte distances using the `listing[].addr` and `listing[].size` fields from a previous assembly attempt.
+Conditional jumps (Jcc) that target a label beyond the short range (-128 to +127 bytes) are automatically promoted to a near form. The assembler transparently emits an inverted-Jcc that skips over a 3-byte near JMP, expanding the 2-byte short jump into a 5-byte sequence. This is completely transparent -- just write `JZ far_label` and the assembler handles the rest.
 
-**Inversion pattern for out-of-range conditionals:**
+LOOP, LOOPZ, LOOPNZ, and JCXZ are NOT auto-promoted because they have no near-form equivalents. If a LOOP target is out of range, replace it with `DEC CX` / `JNZ target`.
 
-```asm
-; BEFORE (fails if far_handler is too far away):
-    CMP AX, 0
-    JZ far_handler
-
-; AFTER (always works):
-    CMP AX, 0
-    JNZ .skip
-    JMP far_handler
-.skip:
-```
-
-**Condition inversion table:**
-
-| Original | Inverted |
-|---|---|
-| `JZ` / `JE` | `JNZ` / `JNE` |
-| `JL` | `JGE` |
-| `JG` | `JLE` |
-| `JB` / `JC` | `JAE` / `JNC` |
-| `JA` | `JBE` |
-| `JS` | `JNS` |
-| `JO` | `JNO` |
-| `JP` | `JNP` |
+The promoted form uses 5 bytes instead of 2, which may affect code layout. Check `listing[].size` in the `--agent` output to see which jumps were promoted.
 
 ---
 
@@ -1232,6 +1672,307 @@ start:
     INT 20h            ; Terminate program
 
 message DB 'Hello, World!', 0Dh, 0Ah, '$'
+```
+
+### Open, Read, and Close a File
+
+```asm
+ORG 100h
+    ; Open file for reading
+    MOV AH, 3Dh
+    MOV AL, 0              ; mode 0 = read-only
+    MOV DX, filename
+    INT 21h
+    JC error               ; CF=1 means open failed (AX=error code)
+    MOV [handle], AX       ; save handle
+
+    ; Read up to 128 bytes
+    MOV BX, [handle]
+    MOV AH, 3Fh
+    MOV CX, 128            ; max bytes to read
+    MOV DX, buffer
+    INT 21h
+    JC error
+    ; AX = actual bytes read (may be < 128 if file is smaller)
+
+    ; Close file
+    MOV BX, [handle]
+    MOV AH, 3Eh
+    INT 21h
+
+    MOV AH, 4Ch
+    MOV AL, 0
+    INT 21h
+error:
+    MOV AH, 4Ch
+    MOV AL, 1              ; exit code 1 = error
+    INT 21h
+
+filename:
+    DB 'DATA.TXT', 0
+handle:
+    DW 0
+buffer:
+    RESB 128
+```
+
+Run with: `agent86 --run-source reader.asm --dos-root ./testdir`
+
+### Create, Write, and Close a File
+
+```asm
+ORG 100h
+    ; Create file (truncates if exists)
+    MOV AH, 3Ch
+    MOV CX, 0              ; normal attributes
+    MOV DX, filename
+    INT 21h
+    JC error
+    MOV [handle], AX
+
+    ; Write data
+    MOV BX, [handle]
+    MOV AH, 40h
+    MOV CX, 5              ; 5 bytes
+    MOV DX, message
+    INT 21h
+    JC error
+
+    ; Close
+    MOV BX, [handle]
+    MOV AH, 3Eh
+    INT 21h
+
+    MOV AH, 4Ch
+    MOV AL, 0
+    INT 21h
+error:
+    MOV AH, 4Ch
+    MOV AL, 1
+    INT 21h
+
+filename:
+    DB 'OUTPUT.TXT', 0
+message:
+    DB 'Hello'
+handle:
+    DW 0
+```
+
+### Write to STDOUT via File Handle
+
+```asm
+ORG 100h
+    ; Handle 1 = STDOUT, always available (no --dos-root needed)
+    MOV BX, 1              ; stdout handle
+    MOV AH, 40h
+    MOV CX, 13
+    MOV DX, msg
+    INT 21h
+
+    MOV AH, 4Ch
+    MOV AL, 0
+    INT 21h
+msg:
+    DB 'Hello, World!', 0Dh, 0Ah
+```
+
+### Directory Listing with FindFirst/FindNext
+
+```asm
+ORG 100h
+    ; Set DTA to our buffer
+    MOV AH, 1Ah
+    MOV DX, dta
+    INT 21h
+
+    ; FindFirst: search for *.TXT
+    MOV AH, 4Eh
+    MOV CX, 0              ; normal files only
+    MOV DX, pattern
+    INT 21h
+    JC done                 ; CF=1 = no files found
+
+next:
+    ; DTA+1Eh contains the matched filename (13 bytes, ASCIIZ)
+    ; Process the file here...
+
+    ; FindNext
+    MOV AH, 4Fh
+    INT 21h
+    JNC next                ; CF=0 = found another file
+
+done:
+    MOV AH, 4Ch
+    MOV AL, 0
+    INT 21h
+
+pattern:
+    DB '*.TXT', 0
+dta:
+    RESB 43                 ; 43-byte DTA buffer
+```
+
+Run with: `agent86 --run-source dirlist.asm --dos-root ./testdir`
+
+### List All Files and Subdirectories
+
+```asm
+ORG 100h
+    ; Set DTA
+    MOV AH, 1Ah
+    MOV DX, dta
+    INT 21h
+
+    ; FindFirst: *.* with CX=10h to include subdirectories
+    MOV AH, 4Eh
+    MOV CX, 10h            ; include directories
+    MOV DX, pattern
+    INT 21h
+    JC done
+
+next:
+    ; Check if this entry is a directory
+    MOV AL, [dta + 15h]    ; attribute byte
+    TEST AL, 10h
+    JZ not_dir
+    ; It's a directory — print "<DIR> " prefix
+    MOV AH, 09h
+    MOV DX, dir_tag
+    INT 21h
+    JMP print_name
+not_dir:
+    ; It's a file — print "     " padding
+    MOV AH, 09h
+    MOV DX, file_tag
+    INT 21h
+print_name:
+    ; Print the filename from DTA+1Eh using character output
+    MOV SI, dta + 1Eh
+print_loop:
+    MOV DL, [SI]
+    CMP DL, 0
+    JE print_done
+    MOV AH, 02h
+    INT 21h
+    INC SI
+    JMP print_loop
+print_done:
+    ; Print newline
+    MOV DL, 0Dh
+    MOV AH, 02h
+    INT 21h
+    MOV DL, 0Ah
+    MOV AH, 02h
+    INT 21h
+
+    ; FindNext
+    MOV AH, 4Fh
+    INT 21h
+    JNC next
+
+done:
+    MOV AH, 4Ch
+    MOV AL, 0
+    INT 21h
+
+pattern:
+    DB '*.*', 0
+dir_tag:
+    DB '<DIR> $'
+file_tag:
+    DB '      $'
+dta:
+    RESB 43
+```
+
+Run with: `agent86 --run-source listall.asm --dos-root ./myfiles`
+
+### File Seek (Read from Specific Offset)
+
+```asm
+ORG 100h
+    ; Open file
+    MOV AH, 3Dh
+    MOV AL, 0
+    MOV DX, fname
+    INT 21h
+    JC error
+    MOV BX, AX             ; handle in BX
+
+    ; Seek to offset 10 from start
+    MOV AH, 42h
+    MOV AL, 0              ; SEEK_SET (0=start, 1=current, 2=end)
+    MOV CX, 0              ; high word of offset
+    MOV DX, 10             ; low word of offset
+    INT 21h
+    JC error
+    ; DX:AX = new absolute position
+
+    ; Read 4 bytes from that position
+    MOV AH, 3Fh
+    MOV CX, 4
+    MOV DX, buf
+    INT 21h
+
+    ; Close
+    MOV AH, 3Eh
+    INT 21h
+
+    MOV AH, 4Ch
+    MOV AL, 0
+    INT 21h
+error:
+    MOV AH, 4Ch
+    MOV AL, 1
+    INT 21h
+
+fname:
+    DB 'DATA.BIN', 0
+buf:
+    RESB 16
+```
+
+### Change Directory and Open Relative File
+
+```asm
+ORG 100h
+    ; Change to subdirectory
+    MOV AH, 3Bh
+    MOV DX, dirname
+    INT 21h
+    JC error
+
+    ; Open a file relative to the new current directory
+    MOV AH, 3Dh
+    MOV AL, 0
+    MOV DX, fname
+    INT 21h
+    JC error
+    MOV BX, AX
+
+    ; Read and close...
+    MOV AH, 3Fh
+    MOV CX, 64
+    MOV DX, buf
+    INT 21h
+    MOV AH, 3Eh
+    INT 21h
+
+    MOV AH, 4Ch
+    MOV AL, 0
+    INT 21h
+error:
+    MOV AH, 4Ch
+    MOV AL, 1
+    INT 21h
+
+dirname:
+    DB 'SUBDIR', 0
+fname:
+    DB 'FILE.TXT', 0
+buf:
+    RESB 64
 ```
 
 ### Direct VRAM Text Output
@@ -1509,6 +2250,11 @@ Additionally, all DOS text output (INT 21h functions 02h, 06h, 09h) is mirrored 
 - `--viewport 0,0,40,25`: Captures only the specified rectangle (col, row, width, height). Useful for focusing on the active area of a program that only uses part of the screen.
 - `--attrs`: Adds a parallel `screenAttrs[]` array containing hex-encoded attribute bytes (2 hex digits per cell). Omitted by default since most debugging only needs the text.
 
+**VRAM pre-fill** is controlled by `--vram-fill [text]`:
+- `--vram-fill "ABCD"`: Tiles the string `ABCD` cyclically across all 4000 character cells (cell 0 = `A`, cell 1 = `B`, ..., cell 4 = `A`, ...). Attribute bytes remain at the default `07h` (light gray on black). This makes it easy to identify which cells a program overwrites.
+- `--vram-fill` (no argument): Fills each cell with a random printable character from `[a-zA-Z0-9!@#$%&*+-=.:~ ]`. Useful for detecting programs that assume VRAM starts as spaces.
+- Without this flag (default): VRAM initializes to spaces (`20h`) with attribute `07h`, matching real CGA hardware power-on state.
+
 **Dual output** means a "Hello World" program using INT 21h/09h will show `"Hello World"` in both the `output` field and the `screen[]` array (at the cursor position). The `output` field captures the raw byte stream; `screen[]` captures the spatial layout on the virtual monitor.
 
 ### Self-Modifying Code
@@ -1542,7 +2288,7 @@ All program output is JSON-safe regardless of what bytes the program produces:
 8. **Duplicate labels emit a warning.** Redefining a label overwrites the previous value but emits a `WARNING` diagnostic with the previous definition line.
 9. **No `TIMES` directive.** Use `RESB` for zero-fill, `REPT N` / `DB val` / `ENDM` for non-zero fill, or `DB` with comma-separated repeated values.
 10. **Emulator: I/O ports not emulated.** `IN` and `OUT` instructions are logged as skipped.
-11. **Emulator: Limited DOS/BIOS interrupt support.** INT 20h, INT 21h (functions 01h, 02h, 06h, 09h, 2Ah, 2Ch, 30h, 4Ch), and INT 10h (functions 00h, 02h, 03h, 06h, 07h, 08h, 09h, 0Ah, 0Eh, 0Fh) are handled. INT 10h font services (AH=11h) are not implemented. Other interrupts are logged as skipped.
+11. **Emulator: Limited DOS/BIOS interrupt support.** INT 20h, INT 21h (console I/O: 01h, 02h, 06h, 09h; system: 0Eh, 19h, 25h, 2Ah, 2Ch, 2Fh, 30h, 35h, 62h; file I/O: 1Ah, 3Bh–3Fh, 40h, 42h–44h, 47h, 4Ch, 4Eh, 4Fh, 57h — file functions require `--dos-root`), INT 10h (functions 00h, 02h, 03h, 06h, 07h, 08h, 09h, 0Ah, 0Eh, 0Fh), and INT 33h (mouse, functions 00h–08h, 0Bh, 0Ch; requires `--mouse` or `--events` with mouse actions) are handled. INT 10h font services (AH=11h) are not implemented. Other interrupts are logged as skipped.
 12. **Emulator: No hardware interrupt simulation.** Timer, keyboard, and other hardware interrupts are not generated.
 
 ---
@@ -1557,7 +2303,7 @@ All diagnostics include an actionable `hint` field. For programmatic handling, p
 |---|---|---|
 | `"Undefined label"` | Symbol not found in symbol table | Hex prefix fix, fuzzy match to closest symbol, or register/local-label guidance |
 | `"Size mismatch"` | Operand widths don't match | Both operand names and their bit widths |
-| `"Conditional jump out of range"` | Jcc displacement exceeds +/-127 | Inverted condition + JMP restructure pattern |
+| `"Conditional jump auto-promoted"` | *(INFO)* Jcc target exceeded short range; assembler auto-emitted inverted-Jcc + near JMP (5 bytes) | The expanded encoding details |
 | `"Loop jump out of range"` | LOOP displacement exceeds +/-127 | `DEC CX / JNZ` replacement pattern |
 | `"Invalid operands"` | Operand types don't match any valid form | All valid forms from ISA DB + what you provided |
 | `"Invalid register in memory"` | Used AX, CX, DX, SP inside `[]` | Lists the four valid registers (BX, BP, SI, DI) |

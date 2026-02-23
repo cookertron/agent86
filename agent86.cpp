@@ -12,6 +12,9 @@
 #include <set>
 #include <filesystem>
 
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
+
 using namespace std;
 
 // --- Windows Output Encoding Fix (Manual Declaration to avoid pollution) ---
@@ -78,6 +81,20 @@ struct SymbolInfo {
     int definedLine;
 };
 
+struct StructField {
+    string name;                   // uppercase field name
+    int offset;                    // byte offset within struct
+    int size;                      // size in bytes
+    vector<uint8_t> defaultValue;  // default bytes, little-endian
+};
+
+struct StructDef {
+    string name;                   // uppercase struct name
+    vector<StructField> fields;
+    int totalSize;
+    int definedLine;
+};
+
 struct AssemblerContext {
     AssemblerState agentState;
     vector<uint8_t> currentLineBytes;
@@ -88,6 +105,14 @@ struct AssemblerContext {
     string currentProcedureName = "";
     bool globalError = false;
     bool encounteredSymbol = false; // NEW: Track if current expression involved a symbol
+    // STRUC support
+    map<string, StructDef> structDefs;
+    string currentStructName = "";
+    int currentStructOffset = 0;
+    vector<StructField> currentStructFields;
+    // Jcc auto-promotion: set of source line numbers whose Jcc must be promoted to near
+    set<int> promotedJumps;
+    bool detectPromotions = false; // only true after first pass 1 establishes symbol table
 };
 
 // --- Source Location Tracking (for INCLUDE directive) ---
@@ -190,7 +215,7 @@ const vector<ISAEntry> isaDB = {
     
     { "LEA", "Load Eff. Addr", { { "REG16", "MEM", "" } }},
     
-    { "JMP", "Unconditional Jump", { { "LABEL", "NONE", "Short/Near" }, { "IMM", "NONE", "Abs" } }},
+    { "JMP", "Unconditional Jump", { { "LABEL", "NONE", "Short/Near" }, { "IMM", "NONE", "Abs" }, { "REG16", "NONE", "Indirect" }, { "MEM", "NONE", "Indirect" } }},
     { "JZ",  "Jump if Zero",         { { "LABEL", "NONE", "Short only (-128 to +127)" } }},
     { "JE",  "Jump if Equal",         { { "LABEL", "NONE", "Short only" } }},
     { "JNZ", "Jump if Not Zero",      { { "LABEL", "NONE", "Short only" } }},
@@ -239,7 +264,7 @@ const vector<ISAEntry> isaDB = {
     { "SCASB","Scan String Byte",   { { "NONE", "NONE", "AL - ES:[DI]" } }},
     { "SCASW","Scan String Word",   { { "NONE", "NONE", "AX - ES:[DI]" } }},
     
-    { "CALL","Call Procedure", { { "LABEL", "NONE", "Near" }, { "IMM", "NONE", "Abs" } }},
+    { "CALL","Call Procedure", { { "LABEL", "NONE", "Near" }, { "IMM", "NONE", "Abs" }, { "REG16", "NONE", "Indirect" }, { "MEM", "NONE", "Indirect" } }},
     { "RET", "Return", { { "NONE", "NONE", "" } }},
     { "INT", "Interrupt", { { "IMM", "NONE", "0-255" } }},
     
@@ -595,7 +620,8 @@ int parseExpression(AssemblerContext& ctx, const vector<Token>& tokens, int& idx
                        "If you meant a memory operand, use [" + tok + "]. "
                        "If you meant the value in the register, this must be computed at runtime, not assembly time.";
             } else if (upper == "DB" || upper == "DW" || upper == "DD" || upper == "EQU" ||
-                       upper == "PROC" || upper == "ENDP" || upper == "ORG") {
+                       upper == "PROC" || upper == "ENDP" || upper == "ORG" ||
+                       upper == "STRUC" || upper == "STRUCT") {
                 hint = "'" + tok + "' is a directive and cannot be used as a value in an expression.";
             } else if (tok == "[" || tok == "]") {
                 hint = "Brackets indicate a memory operand and cannot appear inside an arithmetic expression.";
@@ -982,6 +1008,143 @@ void assembleLine(AssemblerContext& ctx, const vector<Token>& tokens, int lineNu
     int startAddr = ctx.currentAddress;
     ctx.currentLineBytes.clear();
 
+    // --- STRUC mode intercept: when inside a STRUC definition, intercept all lines ---
+    if (!ctx.currentStructName.empty()) {
+        // Check for ENDS (either "STRUCTNAME ENDS" or bare "ENDS")
+        bool isEnds = false;
+        if (tokens.size() >= 2 && tokens[0].type == TokenType::Identifier &&
+            toUpper(tokens[1].value) == "ENDS") {
+            string endsName = toUpper(tokens[0].value);
+            if (endsName != ctx.currentStructName) {
+                logWarning(ctx, lineNum, "ENDS name '" + endsName + "' does not match STRUC name '" + ctx.currentStructName + "'",
+                    "The name after ENDS should match the STRUC name.");
+            }
+            isEnds = true;
+        } else if (tokens.size() >= 1 && toUpper(tokens[0].value) == "ENDS") {
+            isEnds = true;
+        }
+
+        if (isEnds) {
+            // Finalize the struct definition
+            StructDef sd;
+            sd.name = ctx.currentStructName;
+            sd.fields = ctx.currentStructFields;
+            sd.totalSize = ctx.currentStructOffset;
+            sd.definedLine = lineNum;
+
+            if (ctx.isPass1 && ctx.structDefs.count(sd.name)
+                && ctx.structDefs[sd.name].definedLine != lineNum) {
+                logWarning(ctx, lineNum, "Structure '" + sd.name + "' redefined",
+                    "Previous definition will be overwritten.");
+            }
+            ctx.structDefs[sd.name] = sd;
+
+            // Populate symbol table: STRUCTNAME = totalSize, STRUCTNAME.FIELD = offset
+            ctx.symbolTable[sd.name] = { sd.totalSize, true, lineNum };
+            for (const auto& f : sd.fields) {
+                string qualName = sd.name + "." + f.name;
+                ctx.symbolTable[qualName] = { f.offset, true, lineNum };
+            }
+
+            ctx.currentStructName = "";
+            ctx.currentStructFields.clear();
+            ctx.currentStructOffset = 0;
+            return;
+        }
+
+        // Check for nested STRUC/STRUCT
+        if (tokens.size() >= 2 && tokens[0].type == TokenType::Identifier) {
+            string secondUpper = toUpper(tokens[1].value);
+            if (secondUpper == "STRUC" || secondUpper == "STRUCT") {
+                logError(ctx, lineNum, "Nested STRUC not allowed",
+                    "Already inside STRUC '" + ctx.currentStructName + "'. Close it with ENDS first.");
+                return;
+            }
+        }
+
+        // Parse field line: FIELDNAME DB/DW/DD/RESB/RESW [value]
+        if (tokens.size() >= 2 && tokens[0].type == TokenType::Identifier) {
+            string fieldName = toUpper(tokens[0].value);
+            string fieldDir = toUpper(tokens[1].value);
+            int fieldSize = 0;
+            vector<uint8_t> defaultValue;
+
+            if (fieldDir == "DB") {
+                fieldSize = 1;
+                if (tokens.size() >= 3) {
+                    if (tokens[2].type == TokenType::String) {
+                        // Single character default
+                        if (!tokens[2].value.empty())
+                            defaultValue.push_back((uint8_t)tokens[2].value[0]);
+                        else
+                            defaultValue.push_back(0);
+                    } else {
+                        int tIdx = 2;
+                        int val = parseExpression(ctx, tokens, tIdx, 0);
+                        defaultValue.push_back((uint8_t)(val & 0xFF));
+                    }
+                } else {
+                    defaultValue.push_back(0);
+                }
+            } else if (fieldDir == "DW") {
+                fieldSize = 2;
+                if (tokens.size() >= 3) {
+                    int tIdx = 2;
+                    int val = parseExpression(ctx, tokens, tIdx, 0);
+                    defaultValue.push_back((uint8_t)(val & 0xFF));
+                    defaultValue.push_back((uint8_t)((val >> 8) & 0xFF));
+                } else {
+                    defaultValue.push_back(0);
+                    defaultValue.push_back(0);
+                }
+            } else if (fieldDir == "DD") {
+                fieldSize = 4;
+                if (tokens.size() >= 3) {
+                    int tIdx = 2;
+                    int val = parseExpression(ctx, tokens, tIdx, 0);
+                    defaultValue.push_back((uint8_t)(val & 0xFF));
+                    defaultValue.push_back((uint8_t)((val >> 8) & 0xFF));
+                    defaultValue.push_back((uint8_t)((val >> 16) & 0xFF));
+                    defaultValue.push_back((uint8_t)((val >> 24) & 0xFF));
+                } else {
+                    for (int k = 0; k < 4; k++) defaultValue.push_back(0);
+                }
+            } else if (fieldDir == "RESB") {
+                int count = 1;
+                if (tokens.size() >= 3) {
+                    int tIdx = 2;
+                    count = parseExpression(ctx, tokens, tIdx, 0);
+                }
+                fieldSize = count;
+                for (int k = 0; k < count; k++) defaultValue.push_back(0);
+            } else if (fieldDir == "RESW") {
+                int count = 1;
+                if (tokens.size() >= 3) {
+                    int tIdx = 2;
+                    count = parseExpression(ctx, tokens, tIdx, 0);
+                }
+                fieldSize = count * 2;
+                for (int k = 0; k < fieldSize; k++) defaultValue.push_back(0);
+            } else {
+                logError(ctx, lineNum, "Invalid field directive '" + fieldDir + "' in STRUC '" + ctx.currentStructName + "'",
+                    "Fields inside a STRUC must use DB, DW, DD, RESB, or RESW.");
+                return;
+            }
+
+            StructField sf;
+            sf.name = fieldName;
+            sf.offset = ctx.currentStructOffset;
+            sf.size = fieldSize;
+            sf.defaultValue = defaultValue;
+            ctx.currentStructFields.push_back(sf);
+            ctx.currentStructOffset += fieldSize;
+        } else if (tokens.size() == 1 && toUpper(tokens[0].value) != "ENDS") {
+            logError(ctx, lineNum, "Invalid line inside STRUC '" + ctx.currentStructName + "'",
+                "Expected a field definition (e.g., FIELDNAME DW 0) or ENDS.");
+        }
+        return; // No bytes emitted during STRUC definition
+    }
+
     // 0. Check for EQU (Label EQU Value)
     // Structure: Identifier EQU Expression
     if (tokens.size() >= 3 && tokens[0].type == TokenType::Identifier) {
@@ -989,14 +1152,132 @@ void assembleLine(AssemblerContext& ctx, const vector<Token>& tokens, int lineNu
             string label = toUpper(tokens[0].value);
             int valIdx = 2; // Value starts at index 2
             int val = parseExpression(ctx, tokens, valIdx, 0);
-            
-            // Allow redefinition? Usually yes for EQU or no for CONST. EQU is constant per assembly, 
+
+            // Allow redefinition? Usually yes for EQU or no for CONST. EQU is constant per assembly,
             // but = directive allows change. MASM EQU is constant.
             // We'll just overwrite/set.
             ctx.symbolTable[label] = { val, true, tokens[0].line };
-            
+
             // Debug output if needed
             // if (ctx.isPass1) cout << "EQU: " << label << " = " << val << endl;
+            return;
+        }
+    }
+
+    // 0b. STRUC/STRUCT definition start (Identifier STRUC or Identifier STRUCT)
+    if (tokens.size() >= 2 && tokens[0].type == TokenType::Identifier) {
+        string secondUpper = toUpper(tokens[1].value);
+        if (secondUpper == "STRUC" || secondUpper == "STRUCT") {
+            if (!ctx.currentStructName.empty()) {
+                logError(ctx, lineNum, "Nested STRUC not allowed",
+                    "Already inside STRUC '" + ctx.currentStructName + "'. Close it with ENDS first.");
+                return;
+            }
+            if (!ctx.currentProcedureName.empty()) {
+                logError(ctx, lineNum, "STRUC inside PROC not allowed",
+                    "STRUC definitions must be outside any PROC/ENDP block.");
+                return;
+            }
+            ctx.currentStructName = toUpper(tokens[0].value);
+            ctx.currentStructOffset = 0;
+            ctx.currentStructFields.clear();
+            return;
+        }
+    }
+
+    // 0c. Instance allocation (Identifier STRUCTNAME <...>)
+    if (tokens.size() >= 2 && tokens[0].type == TokenType::Identifier) {
+        string possibleStructName = toUpper(tokens[1].value);
+        if (ctx.structDefs.count(possibleStructName)) {
+            const StructDef& sd = ctx.structDefs[possibleStructName];
+            string instanceLabel = toUpper(tokens[0].value);
+
+            // Define label at current address
+            if (ctx.isPass1) {
+                ctx.symbolTable[instanceLabel] = { ctx.currentAddress, false, lineNum };
+            }
+
+            // Parse angle-bracket overrides from raw sourceLine
+            vector<int> overrides; // INT_MIN = use default
+            size_t ltPos = sourceLine.find('<');
+            size_t gtPos = sourceLine.rfind('>');
+            if (ltPos != string::npos && gtPos != string::npos && gtPos > ltPos) {
+                string inside = sourceLine.substr(ltPos + 1, gtPos - ltPos - 1);
+                // Split by commas
+                vector<string> parts;
+                string current;
+                for (char c : inside) {
+                    if (c == ',') {
+                        parts.push_back(current);
+                        current.clear();
+                    } else {
+                        current += c;
+                    }
+                }
+                parts.push_back(current);
+
+                for (const auto& part : parts) {
+                    // Trim whitespace
+                    string trimmed;
+                    for (char c : part) {
+                        if (!isspace((unsigned char)c)) trimmed += c;
+                    }
+                    if (trimmed.empty()) {
+                        overrides.push_back(INT_MIN); // Use default
+                    } else {
+                        // Tokenize and evaluate the override expression
+                        vector<Token> valTokens = tokenize(trimmed, lineNum);
+                        if (!valTokens.empty()) {
+                            int vIdx = 0;
+                            int val = parseExpression(ctx, valTokens, vIdx, 0);
+                            overrides.push_back(val);
+                        } else {
+                            overrides.push_back(INT_MIN);
+                        }
+                    }
+                }
+            }
+
+            // Emit bytes for each field
+            for (size_t fi = 0; fi < sd.fields.size(); fi++) {
+                const StructField& f = sd.fields[fi];
+                if (fi < overrides.size() && overrides[fi] != INT_MIN) {
+                    // Use override value
+                    int val = overrides[fi];
+                    if (f.size == 1) {
+                        emitByte(ctx, (uint8_t)(val & 0xFF));
+                    } else if (f.size == 2) {
+                        emitByte(ctx, (uint8_t)(val & 0xFF));
+                        emitByte(ctx, (uint8_t)((val >> 8) & 0xFF));
+                    } else if (f.size == 4) {
+                        emitByte(ctx, (uint8_t)(val & 0xFF));
+                        emitByte(ctx, (uint8_t)((val >> 8) & 0xFF));
+                        emitByte(ctx, (uint8_t)((val >> 16) & 0xFF));
+                        emitByte(ctx, (uint8_t)((val >> 24) & 0xFF));
+                    } else {
+                        // RESB-style: fill with val for first byte, 0 for rest
+                        emitByte(ctx, (uint8_t)(val & 0xFF));
+                        for (int k = 1; k < f.size; k++) emitByte(ctx, 0);
+                    }
+                } else {
+                    // Use default value
+                    for (uint8_t b : f.defaultValue) {
+                        emitByte(ctx, b);
+                    }
+                }
+            }
+
+            // Record in listing
+            if (!ctx.isPass1) {
+                BinaryMap bm;
+                bm.address = startAddr;
+                bm.sourceLine = lineNum;
+                bm.bytes = ctx.currentLineBytes;
+                bm.size = (int)ctx.currentLineBytes.size();
+                bm.sourceCode = sourceLine;
+                bm.decoded = instanceLabel + " " + possibleStructName;
+                ctx.agentState.listing.push_back(bm);
+            }
             return;
         }
     }
@@ -1013,7 +1294,8 @@ void assembleLine(AssemblerContext& ctx, const vector<Token>& tokens, int lineNu
 
         label = toUpper(label);
         if (ctx.isPass1) {
-            if (ctx.symbolTable.count(label) && !ctx.symbolTable[label].isConstant) {
+            if (ctx.symbolTable.count(label) && !ctx.symbolTable[label].isConstant
+                && ctx.symbolTable[label].definedLine != tokens[0].line) {
                 int prevLine = ctx.symbolTable[label].definedLine;
                 logWarning(ctx, tokens[0].line,
                     "Label '" + label + "' redefined (previous definition at line " + to_string(prevLine) + ")",
@@ -1561,14 +1843,22 @@ void assembleLine(AssemblerContext& ctx, const vector<Token>& tokens, int lineNu
 
     // 7. Jumps
     else if (mnemonic == "JMP") {
-        // Use Near Jump (E9) always to accept any range. 3 bytes.
-        int targetAddr = 0;
-        if (op1.type == Operand::IMMEDIATE) targetAddr = op1.val;
-        
-        // E9 rw. Offset = Target - (Current + 3)
-        int offset = targetAddr - (ctx.currentAddress + 3);
-        emitByte(ctx, 0xE9);
-        emitWord(ctx, offset & 0xFFFF);
+        if (op1.type == Operand::REGISTER && op1.size == 16) {
+            // JMP r16: FF /4 with mod=11
+            emitByte(ctx, 0xFF);
+            emitByte(ctx, 0xC0 | (4 << 3) | op1.reg);
+        } else if (op1.type == Operand::MEMORY) {
+            // JMP [mem]: FF /4
+            emitByte(ctx, 0xFF);
+            emitModRM(ctx, 4, op1);
+        } else {
+            // Near Jump (E9) — label/immediate target
+            int targetAddr = 0;
+            if (op1.type == Operand::IMMEDIATE) targetAddr = op1.val;
+            int offset = targetAddr - (ctx.currentAddress + 3);
+            emitByte(ctx, 0xE9);
+            emitWord(ctx, offset & 0xFFFF);
+        }
     }
     else if (mnemonic.size() >= 2 && mnemonic[0] == 'J' && mnemonic != "JMP" && mnemonic != "JCXZ") {
         // Full Jcc opcode table (all short conditional jumps)
@@ -1589,40 +1879,52 @@ void assembleLine(AssemblerContext& ctx, const vector<Token>& tokens, int lineNu
             {"JG",   0x7F}, {"JNLE", 0x7F}
         };
 
+        // Inversion table: each Jcc maps to its opposite condition
+        static const map<string, string> jccInversions = {
+            {"JZ", "JNZ"}, {"JE", "JNE"}, {"JNZ", "JZ"}, {"JNE", "JE"},
+            {"JL", "JGE"}, {"JNGE", "JGE"}, {"JG", "JLE"}, {"JNLE", "JLE"},
+            {"JLE", "JG"}, {"JNG", "JG"}, {"JGE", "JL"}, {"JNL", "JL"},
+            {"JB", "JNB"}, {"JNAE", "JNB"}, {"JC", "JNC"}, {"JA", "JBE"},
+            {"JNBE", "JBE"}, {"JBE", "JA"}, {"JNA", "JA"}, {"JAE", "JB"},
+            {"JNB", "JB"}, {"JNC", "JC"}, {"JS", "JNS"}, {"JNS", "JS"},
+            {"JO", "JNO"}, {"JNO", "JO"}, {"JP", "JNP"}, {"JPE", "JNP"},
+            {"JNP", "JP"}, {"JPO", "JP"}
+        };
+
         auto it = jccOpcodes.find(mnemonic);
         if (it != jccOpcodes.end()) {
             int targetAddr = 0;
             if (op1.type == Operand::IMMEDIATE) targetAddr = op1.val;
-            
-            // Jcc is 2 bytes. Offset = Target - (Current + 2)
-            int offset = targetAddr - (ctx.currentAddress + 2);
-            
-            if (!ctx.isPass1) {
-                if (offset < -128 || offset > 127) {
-                    // Build inversion hint
-                    static const map<string, string> inversions = {
-                        {"JZ", "JNZ"}, {"JE", "JNE"}, {"JNZ", "JZ"}, {"JNE", "JE"},
-                        {"JL", "JGE"}, {"JNGE", "JGE"}, {"JG", "JLE"}, {"JNLE", "JLE"},
-                        {"JLE", "JG"}, {"JNG", "JG"}, {"JGE", "JL"}, {"JNL", "JL"},
-                        {"JB", "JNB"}, {"JNAE", "JNB"}, {"JC", "JNC"}, {"JA", "JBE"},
-                        {"JNBE", "JBE"}, {"JBE", "JA"}, {"JNA", "JA"}, {"JAE", "JB"},
-                        {"JNB", "JB"}, {"JNC", "JC"}, {"JS", "JNS"}, {"JNS", "JS"},
-                        {"JO", "JNO"}, {"JNO", "JO"}, {"JP", "JNP"}, {"JPE", "JNP"},
-                        {"JNP", "JP"}, {"JPO", "JP"}
-                    };
-                    string hint = "Displacement is " + to_string(offset) + " bytes (range: -128 to +127). ";
-                    auto inv = inversions.find(mnemonic);
-                    if (inv != inversions.end()) {
-                        hint += "Restructure as: " + inv->second + " .skip / JMP target / .skip:";
-                    } else {
-                        hint += "Use an inverted condition with a near JMP to reach far targets.";
-                    }
-                    logError(ctx, tokens[0].line, "Conditional jump out of range (" + to_string(offset) + ")", hint);
-                }
-            }
 
-            emitByte(ctx, it->second);
-            emitByte(ctx, offset & 0xFF);
+            bool promoted = ctx.promotedJumps.count(lineNum) > 0;
+
+            if (promoted) {
+                // Emit promoted form: inverted-Jcc over a near JMP
+                // Layout: [inverted-Jcc +5] [JMP near target] = 2 + 3 = 5 bytes
+                auto inv = jccInversions.find(mnemonic);
+                string invMnemonic = (inv != jccInversions.end()) ? inv->second : "JNO"; // fallback
+                auto invIt = jccOpcodes.find(invMnemonic);
+                uint8_t invOpcode = (invIt != jccOpcodes.end()) ? invIt->second : 0x71;
+
+                // inverted Jcc: skip over the 3-byte JMP (displacement = +3)
+                emitByte(ctx, invOpcode);
+                emitByte(ctx, 0x03);
+                // JMP near rel16: E9 + 16-bit offset
+                int jmpOffset = targetAddr - (ctx.currentAddress + 3);
+                emitByte(ctx, 0xE9);
+                emitWord(ctx, jmpOffset & 0xFFFF);
+            } else {
+                // Short form: 2 bytes
+                int offset = targetAddr - (ctx.currentAddress + 2);
+
+                if (ctx.detectPromotions && (offset < -128 || offset > 127)) {
+                    // Mark for promotion — will trigger a re-run of pass 1
+                    ctx.promotedJumps.insert(lineNum);
+                }
+
+                emitByte(ctx, it->second);
+                emitByte(ctx, offset & 0xFF);
+            }
         }
     }
     // 8. Loop Instructions
@@ -1705,13 +2007,22 @@ void assembleLine(AssemblerContext& ctx, const vector<Token>& tokens, int lineNu
     else if (mnemonic == "SCASW") emitByte(ctx, 0xAF);
     // 8. Call / Ret
     else if (mnemonic == "CALL") {
-        int targetAddr = 0;
-        if (op1.type == Operand::IMMEDIATE) targetAddr = op1.val;
-        
-        // Rel16: Target - (Current + 3)
-        int offset = targetAddr - (ctx.currentAddress + 3);
-        emitByte(ctx, 0xE8);
-        emitWord(ctx, offset & 0xFFFF);
+        if (op1.type == Operand::REGISTER && op1.size == 16) {
+            // CALL r16: FF /2 with mod=11
+            emitByte(ctx, 0xFF);
+            emitByte(ctx, 0xC0 | (2 << 3) | op1.reg);
+        } else if (op1.type == Operand::MEMORY) {
+            // CALL [mem]: FF /2
+            emitByte(ctx, 0xFF);
+            emitModRM(ctx, 2, op1);
+        } else {
+            // Near CALL (E8) — label/immediate target
+            int targetAddr = 0;
+            if (op1.type == Operand::IMMEDIATE) targetAddr = op1.val;
+            int offset = targetAddr - (ctx.currentAddress + 3);
+            emitByte(ctx, 0xE8);
+            emitWord(ctx, offset & 0xFFFF);
+        }
     }
     else if (mnemonic == "RET") {
         emitByte(ctx, 0xC3);
@@ -3026,7 +3337,7 @@ struct CPU {
 
 struct Memory {
     uint8_t data[65536] = {};
-    uint8_t vram[8000] = {};       // 80x50x2 bytes (char + attr interleaved)
+    uint8_t vram[16000] = {};      // 2 pages of 80x50x2 bytes (char + attr interleaved)
     bool vramDirty = false;         // Track if VRAM was touched this cycle
 
     // === Legacy flat access (keep for backward compat) ===
@@ -3043,17 +3354,17 @@ struct Memory {
     // === New: Segment-aware access ===
     uint8_t sread8(uint16_t seg, uint16_t off) const {
         uint32_t linear = (uint32_t)seg * 16 + off;
-        if (linear >= 0xB8000 && linear < 0xB9F40)
+        if (linear >= 0xB8000 && linear < 0xBBE80)
             return vram[linear - 0xB8000];
         return data[off & 0xFFFF];   // Flat fallback
     }
 
     uint16_t sread16(uint16_t seg, uint16_t off) const {
         uint32_t linear = (uint32_t)seg * 16 + off;
-        if (linear >= 0xB8000 && linear < 0xB9F40) {
+        if (linear >= 0xB8000 && linear < 0xBBE80) {
             uint32_t idx = linear - 0xB8000;
             uint8_t lo = vram[idx];
-            uint8_t hi = (idx + 1 < 8000) ? vram[idx + 1] : 0;
+            uint8_t hi = (idx + 1 < 16000) ? vram[idx + 1] : 0;
             return lo | ((uint16_t)hi << 8);
         }
         return data[off & 0xFFFF] |
@@ -3062,7 +3373,7 @@ struct Memory {
 
     void swrite8(uint16_t seg, uint16_t off, uint8_t val) {
         uint32_t linear = (uint32_t)seg * 16 + off;
-        if (linear >= 0xB8000 && linear < 0xB9F40) {
+        if (linear >= 0xB8000 && linear < 0xBBE80) {
             vram[linear - 0xB8000] = val;
             vramDirty = true;
             return;
@@ -3072,10 +3383,10 @@ struct Memory {
 
     void swrite16(uint16_t seg, uint16_t off, uint16_t val) {
         uint32_t linear = (uint32_t)seg * 16 + off;
-        if (linear >= 0xB8000 && linear < 0xB9F40) {
+        if (linear >= 0xB8000 && linear < 0xBBE80) {
             uint32_t idx = linear - 0xB8000;
             vram[idx] = (uint8_t)(val & 0xFF);
-            if (idx + 1 < 8000) vram[idx + 1] = (uint8_t)(val >> 8);
+            if (idx + 1 < 16000) vram[idx + 1] = (uint8_t)(val >> 8);
             vramDirty = true;
             return;
         }
@@ -3096,7 +3407,7 @@ struct VRAMState {
     uint8_t defaultAttr = 0x07;  // Light grey on black
     int cols = 80;
     int rows = 50;
-    // Note: actual VRAM storage is in Memory::vram[8000]
+    // Note: actual VRAM storage is in Memory::vram[16000]
 
     uint16_t cursorOffset() const {
         return (uint16_t)(cursorRow * cols + cursorCol) * 2;
@@ -3136,7 +3447,7 @@ struct VRAMState {
 
     void writeCharAtCursor(Memory& mem, uint8_t ch, uint8_t attr) {
         uint16_t off = cursorOffset();
-        if (off + 1 < 8000) {
+        if (off + 1 < 16000) {
             mem.vram[off] = ch;
             mem.vram[off + 1] = attr;
             mem.vramDirty = true;
@@ -3154,14 +3465,390 @@ struct VRAMState {
     }
 };
 
+struct MouseState {
+    bool installed = false;   // true when --mouse is used
+    bool visible = false;     // INT 33h/01 show, /02 hide
+    int16_t x = 0;           // pixel X (0-639 in text mode)
+    int16_t y = 0;           // pixel Y (0-199 in text mode)
+    uint16_t buttons = 0;    // bit 0=left, bit 1=right, bit 2=middle
+    int16_t minX = 0, maxX = 639;
+    int16_t minY = 0, maxY = 199;
+    uint16_t pressCount[3] = {};   // per-button press counters
+    uint16_t releaseCount[3] = {}; // per-button release counters
+};
+
+struct EventAction {
+    string triggerType;    // "read", "poll", "tick", "int21", "int33"
+    int triggerCount = 0;  // fire when counter reaches this value
+    bool hasMouse = false;
+    int16_t mouseX = 0, mouseY = 0;
+    uint16_t mouseButtons = 0;
+    bool hasKeys = false;
+    string keys;
+    bool snapshot = false;
+    bool fired = false;
+    int firedAtCycle = -1;
+};
+
+struct EventCounters {
+    int readCount = 0;
+    int pollCount = 0;
+    int int21Count = 0;
+    int int33Count = 0;
+    int tickCount = 0;
+};
+
+struct EventState {
+    vector<EventAction> events;
+    EventCounters counters;
+};
+
+// --- DOS File I/O State ---
+
+struct DOSFileEntry {
+    FILE* fp = nullptr;
+    string hostPath;       // resolved host path
+    string dosPath;        // original DOS path
+    uint8_t mode = 0;      // 0=read, 1=write, 2=r/w
+    bool isDevice = false;  // true for handles 0-4
+};
+
+struct DOSSearchState {
+    vector<pair<string,string>> entries; // (hostPath, dosName8_3) pre-enumerated
+    size_t nextIndex = 0;
+    uint8_t searchAttr = 0;
+    string pattern;        // DOS wildcard pattern e.g. "*.*"
+};
+
+struct DOSFileState {
+    string rootPath;                       // host dir from --dos-root (canonical)
+    string currentDir;                     // current DOS directory, e.g. "" (root) or "SUBDIR"
+    uint8_t currentDrive = 2;              // C: = 2
+    uint16_t dtaSegment = 0, dtaOffset = 0x0080; // default DTA in PSP
+    map<int, DOSFileEntry> handles;        // file handle table
+    int nextHandle = 5;                    // next available handle (0-4 are devices)
+    vector<DOSSearchState> searches;       // active FindFirst/FindNext contexts
+    bool enabled = false;                  // true when --dos-root is set
+    // Tracking for JSON output
+    int filesOpened = 0;
+    int filesClosed = 0;
+    int bytesRead = 0;
+    int bytesWritten = 0;
+    int dirSearches = 0;
+    int errors = 0;
+};
+
+// Convert DOS path to sandboxed host path. Returns empty string and sets error on failure.
+static string resolveDosPath(const DOSFileState& dosFs, const string& dosPath, bool& pathError) {
+    namespace fs = std::filesystem;
+    pathError = false;
+    string p = dosPath;
+    // Replace backslashes with forward slashes
+    for (char& c : p) { if (c == '\\') c = '/'; }
+    // Strip drive letter if present (e.g. "C:")
+    if (p.size() >= 2 && isalpha((unsigned char)p[0]) && p[1] == ':') {
+        p = p.substr(2);
+    }
+    // Strip leading slash for joining
+    while (!p.empty() && p[0] == '/') p = p.substr(1);
+    // If relative, prepend current directory
+    if (!p.empty() && p[0] != '/') {
+        if (!dosFs.currentDir.empty()) {
+            p = dosFs.currentDir + "/" + p;
+        }
+    }
+    // Join with root path
+    fs::path hostPath = fs::path(dosFs.rootPath) / p;
+    // Resolve to canonical form (weakly_canonical handles non-existent trailing components)
+    fs::path resolved = fs::weakly_canonical(hostPath);
+    string resolvedStr = resolved.string();
+    // Normalize separators for comparison
+    string rootNorm = dosFs.rootPath;
+    for (char& c : resolvedStr) { if (c == '\\') c = '/'; }
+    for (char& c : rootNorm) { if (c == '\\') c = '/'; }
+    // Sandbox check: resolved path must start with root path
+    if (resolvedStr.size() < rootNorm.size() ||
+        resolvedStr.substr(0, rootNorm.size()) != rootNorm) {
+        pathError = true;
+        return "";
+    }
+    return resolved.string();
+}
+
+// Convert host filename to 8.3 DOS name (uppercase)
+static string toShortName(const string& hostName) {
+    // Find the last dot for extension split
+    string name = hostName;
+    // Uppercase
+    for (char& c : name) c = (char)toupper((unsigned char)c);
+    size_t dot = name.rfind('.');
+    string base, ext;
+    if (dot != string::npos && dot > 0) {
+        base = name.substr(0, dot);
+        ext = name.substr(dot + 1);
+    } else {
+        base = name;
+    }
+    if (base.size() > 8) base = base.substr(0, 8);
+    if (ext.size() > 3) ext = ext.substr(0, 3);
+    if (ext.empty()) return base;
+    return base + "." + ext;
+}
+
+// Match a DOS filename against a wildcard pattern (e.g. "*.TXT", "FILE?.DAT")
+static bool matchesDosWildcard(const string& name, const string& pattern) {
+    // Both should be uppercase already
+    size_t ni = 0, pi = 0;
+    while (ni < name.size() && pi < pattern.size()) {
+        if (pattern[pi] == '*') {
+            // Star matches everything to next segment
+            pi++;
+            if (pi >= pattern.size()) return true; // trailing * matches all
+            // Find next non-wildcard char to anchor
+            while (ni < name.size()) {
+                if (matchesDosWildcard(name.substr(ni), pattern.substr(pi)))
+                    return true;
+                ni++;
+            }
+            return matchesDosWildcard(name.substr(ni), pattern.substr(pi));
+        } else if (pattern[pi] == '?' || pattern[pi] == name[ni]) {
+            ni++;
+            pi++;
+        } else {
+            return false;
+        }
+    }
+    // Consume trailing wildcards
+    while (pi < pattern.size() && (pattern[pi] == '*' || pattern[pi] == '?')) pi++;
+    // Handle trailing .<wildcards> matching names with no extension (e.g. *.* matches SUBDIR)
+    if (ni == name.size() && pi < pattern.size() && pattern[pi] == '.') {
+        size_t check = pi + 1;
+        while (check < pattern.size() && (pattern[check] == '*' || pattern[check] == '?')) check++;
+        if (check == pattern.size()) pi = check;
+    }
+    return ni == name.size() && pi == pattern.size();
+}
+
+// Pack host file time into DOS date/time words
+static void toDosDateTime(const filesystem::file_time_type& ft, uint16_t& dosDate, uint16_t& dosTime) {
+    // Convert to system_clock time_point
+    auto sctp = chrono::time_point_cast<chrono::system_clock::duration>(
+        ft - filesystem::file_time_type::clock::now() + chrono::system_clock::now());
+    time_t tt = chrono::system_clock::to_time_t(sctp);
+    struct tm tmBuf;
+#ifdef _WIN32
+    localtime_s(&tmBuf, &tt);
+#else
+    localtime_r(&tt, &tmBuf);
+#endif
+    // DOS date: bits 15-9=year-1980, 8-5=month, 4-0=day
+    int year = tmBuf.tm_year + 1900;
+    if (year < 1980) year = 1980;
+    dosDate = (uint16_t)(((year - 1980) << 9) | ((tmBuf.tm_mon + 1) << 5) | tmBuf.tm_mday);
+    // DOS time: bits 15-11=hour, 10-5=minute, 4-0=seconds/2
+    dosTime = (uint16_t)((tmBuf.tm_hour << 11) | (tmBuf.tm_min << 5) | (tmBuf.tm_sec / 2));
+}
+
+// Read a null-terminated string from emulator memory at seg:off
+static string readDosString(const Memory& mem, uint16_t seg, uint16_t off) {
+    string s;
+    for (int i = 0; i < 256; i++) {
+        uint8_t ch = mem.sread8(seg, (uint16_t)(off + i));
+        if (ch == 0) break;
+        s += (char)ch;
+    }
+    return s;
+}
+
+// Sentinel byte in stdinSource: the next byte has Shift held.
+// Used by \S escape in --input and consumed transparently by IOCapture::readChar().
+static const uint8_t SHIFT_PREFIX = 0xFE;
+
+// Decode C-style escape sequences in --input strings so that binary bytes
+// (including 0x00 for extended-key prefixes) can be specified on the command line.
+// Supported: \xHH  \0  \n  \r  \t  \S (shift prefix)  and backslash-backslash
+// \S marks the next character as having Shift held (inserts 0xFE sentinel).
+// For extended keys (two-byte sequences), use \S before each byte: \S\x00\S\x4B
+static string unescapeInput(const char* raw) {
+    string out;
+    for (const char* p = raw; *p; ) {
+        if (*p == '\\' && *(p+1)) {
+            char next = *(p+1);
+            if (next == 'S') {
+                out += (char)SHIFT_PREFIX;
+                p += 2;
+            } else if (next == 'x' && isxdigit((unsigned char)*(p+2)) && isxdigit((unsigned char)*(p+3))) {
+                // \xHH
+                char hex[3] = { *(p+2), *(p+3), 0 };
+                out += (char)strtoul(hex, nullptr, 16);
+                p += 4;
+            } else if (next == '0') {
+                out += '\0';
+                p += 2;
+            } else if (next == 'n') {
+                out += '\n';
+                p += 2;
+            } else if (next == 'r') {
+                out += '\r';
+                p += 2;
+            } else if (next == 't') {
+                out += '\t';
+                p += 2;
+            } else if (next == '\\') {
+                out += '\\';
+                p += 2;
+            } else {
+                out += *p++;  // unrecognized escape, keep literal
+            }
+        } else {
+            out += *p++;
+        }
+    }
+    return out;
+}
+
+// --- Events JSON parser ---
+static void skipJsonWs(const char*& p) { while (*p && isspace((unsigned char)*p)) p++; }
+
+static string readJsonString(const char*& p, string& error) {
+    skipJsonWs(p);
+    if (*p != '"') { error = "Expected '\"'"; return ""; }
+    p++;
+    string out;
+    while (*p && *p != '"') {
+        if (*p == '\\' && *(p+1)) {
+            p++;
+            switch (*p) {
+                case '"': out += '"'; break;
+                case '\\': out += '\\'; break;
+                case '/': out += '/'; break;
+                case 'n': out += '\n'; break;
+                case 'r': out += '\r'; break;
+                case 't': out += '\t'; break;
+                case 'x':
+                    if (isxdigit((unsigned char)*(p+1)) && isxdigit((unsigned char)*(p+2))) {
+                        char hex[3] = { *(p+1), *(p+2), 0 };
+                        out += (char)strtoul(hex, nullptr, 16);
+                        p += 2;
+                    } else { out += 'x'; }
+                    break;
+                default: out += *p; break;
+            }
+        } else {
+            out += *p;
+        }
+        p++;
+    }
+    if (*p == '"') p++;
+    else if (error.empty()) error = "Unterminated string";
+    return out;
+}
+
+static int readJsonInt(const char*& p, string& error) {
+    skipJsonWs(p);
+    bool neg = false;
+    if (*p == '-') { neg = true; p++; }
+    if (!isdigit((unsigned char)*p)) { error = "Expected integer"; return 0; }
+    int val = 0;
+    while (isdigit((unsigned char)*p)) { val = val * 10 + (*p - '0'); p++; }
+    return neg ? -val : val;
+}
+
+static bool readJsonBool(const char*& p, string& error) {
+    skipJsonWs(p);
+    if (strncmp(p, "true", 4) == 0) { p += 4; return true; }
+    if (strncmp(p, "false", 5) == 0) { p += 5; return false; }
+    error = "Expected true or false";
+    return false;
+}
+
+static vector<EventAction> parseEvents(const string& json, string& error) {
+    vector<EventAction> events;
+    const char* p = json.c_str();
+    skipJsonWs(p);
+    if (*p != '[') { error = "Expected '[' at start of events array"; return events; }
+    p++;
+    skipJsonWs(p);
+    if (*p == ']') { p++; return events; }
+    while (true) {
+        skipJsonWs(p);
+        if (*p != '{') { error = "Expected '{' at start of event object"; return events; }
+        p++;
+        EventAction ev;
+        while (true) {
+            skipJsonWs(p);
+            if (*p == '}') { p++; break; }
+            if (*p == ',') { p++; continue; }
+            string key = readJsonString(p, error);
+            if (!error.empty()) return events;
+            skipJsonWs(p);
+            if (*p != ':') { error = "Expected ':' after key \"" + key + "\""; return events; }
+            p++;
+            skipJsonWs(p);
+            if (key == "on") {
+                string val = readJsonString(p, error);
+                if (!error.empty()) return events;
+                size_t colon = val.find(':');
+                if (colon == string::npos) { error = "Invalid trigger: \"" + val + "\" (expected type:count)"; return events; }
+                ev.triggerType = val.substr(0, colon);
+                ev.triggerCount = atoi(val.substr(colon + 1).c_str());
+                if (ev.triggerType != "read" && ev.triggerType != "poll" && ev.triggerType != "tick" &&
+                    ev.triggerType != "int21" && ev.triggerType != "int33") {
+                    error = "Unknown trigger type: \"" + ev.triggerType + "\"";
+                    return events;
+                }
+                if (ev.triggerCount <= 0) { error = "Trigger count must be positive: " + val; return events; }
+            } else if (key == "mouse") {
+                if (*p != '[') { error = "Expected '[' for mouse value"; return events; }
+                p++;
+                ev.mouseX = (int16_t)readJsonInt(p, error); if (!error.empty()) return events;
+                skipJsonWs(p); if (*p == ',') p++;
+                ev.mouseY = (int16_t)readJsonInt(p, error); if (!error.empty()) return events;
+                skipJsonWs(p); if (*p == ',') p++;
+                ev.mouseButtons = (uint16_t)readJsonInt(p, error); if (!error.empty()) return events;
+                skipJsonWs(p);
+                if (*p != ']') { error = "Expected ']' after mouse array"; return events; }
+                p++;
+                ev.hasMouse = true;
+            } else if (key == "keys") {
+                string raw = readJsonString(p, error);
+                if (!error.empty()) return events;
+                ev.keys = unescapeInput(raw.c_str());
+                ev.hasKeys = true;
+            } else if (key == "snapshot") {
+                ev.snapshot = readJsonBool(p, error);
+                if (!error.empty()) return events;
+            } else {
+                error = "Unknown event key: \"" + key + "\"";
+                return events;
+            }
+        }
+        events.push_back(ev);
+        skipJsonWs(p);
+        if (*p == ',') { p++; continue; }
+        if (*p == ']') { p++; break; }
+        error = "Expected ',' or ']' after event object";
+        return events;
+    }
+    return events;
+}
+
 struct IOCapture {
     string stdoutBuf;
     string stdinSource;
     size_t stdinPos = 0;
+    uint8_t shiftFlags = 0; // INT 16h/02h shift-flags byte (bit 0=RShift, bit 1=LShift)
     int exitCode = 0;
     int readChar() {
-        if (stdinPos < stdinSource.size()) return (unsigned char)stdinSource[stdinPos++];
-        return -1;
+        if (stdinPos >= stdinSource.size()) return -1;
+        if ((unsigned char)stdinSource[stdinPos] == SHIFT_PREFIX) {
+            shiftFlags = 0x02; // Left Shift held
+            stdinPos++;
+            if (stdinPos >= stdinSource.size()) return -1;
+        } else {
+            shiftFlags = 0x00;
+        }
+        return (unsigned char)stdinSource[stdinPos++];
     }
 };
 
@@ -3179,8 +3866,19 @@ struct EmulatorConfig {
     int vpCol = 0, vpRow = 0;      // Top-left corner of viewport
     int vpWidth = 80, vpHeight = 50; // Viewport dimensions
     bool vpAttrs = false;           // Include attribute data in output
-    string screenshotFile;          // --screenshot <path.bmp>
+    string screenshotFile;          // --screenshot <path.png|jpg|bmp>
     bool screenshotFont8x8 = false; // --font 8x8 (default: 8x16 VGA)
+    // --- Mouse ---
+    int mouseX = 0, mouseY = 0;
+    uint16_t mouseButtons = 0;      // bit 0=left, 1=right, 2=middle
+    bool mouseEnabled = false;
+    // --- Events ---
+    vector<EventAction> events;
+    // --- DOS File I/O ---
+    string dosRoot;          // --dos-root host directory path
+    // --- VRAM fill ---
+    bool vramFill = false;
+    string vramFillText;     // empty = random fill
 };
 
 struct Snapshot {
@@ -3227,6 +3925,30 @@ struct EmulatorResult {
     int cursorRow = 0;
     int cursorCol = 0;
     string screenshotPath;  // populated on successful BMP write
+    // Mouse (only populated when --mouse is used)
+    bool mouseEnabled = false;
+    int mouseX = 0, mouseY = 0;
+    uint16_t mouseButtons = 0;
+    bool mouseVisible = false;
+    // --- Events ---
+    struct EventLogEntry {
+        string on;
+        int cycle;
+        string action;
+    };
+    int eventsTotal = 0;
+    int eventsFired = 0;
+    vector<EventLogEntry> eventLog;
+    // --- File I/O ---
+    struct FileIOStats {
+        int filesOpened = 0;
+        int filesClosed = 0;
+        int bytesRead = 0;
+        int bytesWritten = 0;
+        int dirSearches = 0;
+        int errors = 0;
+    };
+    FileIOStats fileIO;
 };
 
 // --- Section 2: Core Engine ---
@@ -3477,7 +4199,7 @@ void handleInt10(CPU& cpu, Memory& mem, VRAMState& vram, EmulatorResult& result)
         case 0x08: { // Read char/attr at cursor
             // BH = page (ignored)
             uint16_t off = vram.cursorOffset();
-            if (off + 1 < 8000) {
+            if (off + 1 < 16000) {
                 cpu.setReg8(0, mem.vram[off]);     // AL = char
                 cpu.setReg8(4, mem.vram[off+1]);   // AH = attr
             }
@@ -3508,7 +4230,7 @@ void handleInt10(CPU& cpu, Memory& mem, VRAMState& vram, EmulatorResult& result)
             int row = vram.cursorRow;
             for (uint16_t i = 0; i < cx && row < vram.rows; i++) {
                 int off = (row * vram.cols + col) * 2;
-                if (off + 1 < 8000) {
+                if (off + 1 < 16000) {
                     mem.vram[off] = ch;
                     // attribute byte at off+1 left unchanged
                 }
@@ -3535,11 +4257,55 @@ void handleInt10(CPU& cpu, Memory& mem, VRAMState& vram, EmulatorResult& result)
     }
 }
 
-void handleInt21(CPU& cpu, Memory& mem, IOCapture& io, EmulatorResult& result, VRAMState& vram) {
+// Forward declaration (defined in Section 6)
+void captureSnapshot(const CPU& cpu, const Memory& mem,
+                     const vector<uint8_t>& code,
+                     int cycle, const string& reason,
+                     const EmulatorConfig& config,
+                     const VRAMState& vram,
+                     vector<Snapshot>& snapshots);
+
+static void processEvents(EventState& evState, int cycle, MouseState& mouse, IOCapture& io,
+                          EmulatorResult& result, const CPU& cpu, const Memory& mem,
+                          const vector<uint8_t>& code, const EmulatorConfig& config,
+                          const VRAMState& vram) {
+    for (auto& ev : evState.events) {
+        if (ev.fired) continue;
+        int current = 0;
+        if (ev.triggerType == "read") current = evState.counters.readCount;
+        else if (ev.triggerType == "poll") current = evState.counters.pollCount;
+        else if (ev.triggerType == "tick") current = evState.counters.tickCount;
+        else if (ev.triggerType == "int21") current = evState.counters.int21Count;
+        else if (ev.triggerType == "int33") current = evState.counters.int33Count;
+        if (current >= ev.triggerCount) {
+            ev.fired = true;
+            ev.firedAtCycle = cycle;
+            if (ev.hasMouse) {
+                mouse.x = ev.mouseX; mouse.y = ev.mouseY; mouse.buttons = ev.mouseButtons;
+            }
+            if (ev.hasKeys) {
+                io.stdinSource.insert(io.stdinSource.begin() + io.stdinPos,
+                                      ev.keys.begin(), ev.keys.end());
+            }
+            if (ev.snapshot) {
+                captureSnapshot(cpu, mem, code, cycle,
+                               "Event: " + ev.triggerType + ":" + to_string(ev.triggerCount),
+                               config, vram, result.snapshots);
+            }
+        }
+    }
+}
+
+void handleInt21(CPU& cpu, Memory& mem, IOCapture& io, EmulatorResult& result, VRAMState& vram,
+                 EventState& evState, MouseState& mouse, const vector<uint8_t>& code,
+                 const EmulatorConfig& config, int cycle, DOSFileState& dosFs) {
     static const int MAX_OUTPUT = 4096;
+    evState.counters.int21Count++;
     uint8_t ah = cpu.getReg8(4); // AH
     switch (ah) {
         case 0x01: { // Read char with echo
+            evState.counters.readCount++;
+            processEvents(evState, cycle, mouse, io, result, cpu, mem, code, config, vram);
             int ch = io.readChar();
             if (ch < 0) ch = 0x0D;
             cpu.setReg8(0, (uint8_t)ch); // AL
@@ -3551,7 +4317,7 @@ void handleInt21(CPU& cpu, Memory& mem, IOCapture& io, EmulatorResult& result, V
         case 0x02: { // Write DL to stdout
             uint8_t dl = cpu.getReg8(2);
             if ((int)io.stdoutBuf.size() < MAX_OUTPUT) {
-                io.stdoutBuf += (char)dl; 
+                io.stdoutBuf += (char)dl;
             }
             ttyCharToVRAM(mem, vram, dl);
             break;
@@ -3559,6 +4325,8 @@ void handleInt21(CPU& cpu, Memory& mem, IOCapture& io, EmulatorResult& result, V
         case 0x06: { // Direct console I/O
             uint8_t dl = cpu.getReg8(2);
             if (dl == 0xFF) {
+                evState.counters.readCount++;
+                processEvents(evState, cycle, mouse, io, result, cpu, mem, code, config, vram);
                 int ch = io.readChar();
                 if (ch < 0) { cpu.setFlag(CPU::ZF, true); cpu.setReg8(0, 0); }
                 else { cpu.setFlag(CPU::ZF, false); cpu.setReg8(0, (uint8_t)ch); }
@@ -3589,11 +4357,23 @@ void handleInt21(CPU& cpu, Memory& mem, IOCapture& io, EmulatorResult& result, V
             }
             break;
         }
-        case 0x4C: { // Exit with AL as exit code
-            io.exitCode = cpu.getReg8(0); // AL
-            result.halted = true;
-            result.haltReason = "INT 21h/4Ch exit (code=" + to_string(io.exitCode) + ")";
-            result.exitCode = io.exitCode;
+        case 0x0E: { // Select disk - set current drive
+            uint8_t dl = cpu.getReg8(2); // DL = drive number
+            dosFs.currentDrive = dl;
+            cpu.setReg8(0, 26); // AL = total drives (report 26: A-Z)
+            break;
+        }
+        case 0x19: { // Get current disk
+            cpu.setReg8(0, dosFs.currentDrive); // AL = current drive (0=A, 2=C)
+            break;
+        }
+        case 0x1A: { // Set DTA address
+            dosFs.dtaSegment = cpu.sregs[3]; // DS
+            dosFs.dtaOffset = cpu.regs[2];   // DX
+            break;
+        }
+        case 0x25: { // Set interrupt vector - stub (programs set INT 24h error handler)
+            // Silently ignore
             break;
         }
         case 0x2A: { // Get date - stub
@@ -3610,9 +4390,598 @@ void handleInt21(CPU& cpu, Memory& mem, IOCapture& io, EmulatorResult& result, V
             cpu.setReg8(2, 0);   // DL = centisecond
             break;
         }
+        case 0x2F: { // Get DTA address
+            cpu.sregs[0] = dosFs.dtaSegment; // ES
+            cpu.regs[3] = dosFs.dtaOffset;   // BX
+            break;
+        }
         case 0x30: { // Get DOS version - stub
             cpu.setReg8(0, 5);   // AL = major
             cpu.setReg8(4, 0);   // AH = minor
+            break;
+        }
+        case 0x35: { // Get interrupt vector - stub
+            cpu.sregs[0] = 0;  // ES = 0
+            cpu.regs[3] = 0;   // BX = 0
+            break;
+        }
+        case 0x3B: { // Change directory
+            if (!dosFs.enabled) {
+                cpu.setFlag(CPU::CF, true);
+                cpu.regs[0] = 3; // path not found
+                dosFs.errors++;
+                break;
+            }
+            {
+                string dosPath = readDosString(mem, cpu.sregs[3], cpu.regs[2]);
+                bool pathError = false;
+                string hostPath = resolveDosPath(dosFs, dosPath, pathError);
+                namespace fs = std::filesystem;
+                if (pathError || !fs::is_directory(hostPath)) {
+                    cpu.setFlag(CPU::CF, true);
+                    cpu.regs[0] = 3; // path not found
+                    dosFs.errors++;
+                } else {
+                    // Convert host path back to relative DOS dir within root
+                    string rootNorm = dosFs.rootPath;
+                    string hostNorm = hostPath;
+                    for (char& c : rootNorm) { if (c == '\\') c = '/'; }
+                    for (char& c : hostNorm) { if (c == '\\') c = '/'; }
+                    string rel;
+                    if (hostNorm.size() > rootNorm.size() + 1) {
+                        rel = hostNorm.substr(rootNorm.size() + 1);
+                    }
+                    // Uppercase
+                    for (char& c : rel) c = (char)toupper((unsigned char)c);
+                    dosFs.currentDir = rel;
+                    cpu.setFlag(CPU::CF, false);
+                }
+            }
+            break;
+        }
+        case 0x3C: { // Create file
+            if (!dosFs.enabled) {
+                cpu.setFlag(CPU::CF, true);
+                cpu.regs[0] = 2; // file not found (no filesystem)
+                dosFs.errors++;
+                break;
+            }
+            {
+                string dosPath = readDosString(mem, cpu.sregs[3], cpu.regs[2]);
+                bool pathError = false;
+                string hostPath = resolveDosPath(dosFs, dosPath, pathError);
+                if (pathError) {
+                    cpu.setFlag(CPU::CF, true);
+                    cpu.regs[0] = 3; // path not found
+                    dosFs.errors++;
+                    break;
+                }
+                FILE* fp = fopen(hostPath.c_str(), "w+b");
+                if (!fp) {
+                    cpu.setFlag(CPU::CF, true);
+                    cpu.regs[0] = 5; // access denied
+                    dosFs.errors++;
+                    break;
+                }
+                int handle = dosFs.nextHandle++;
+                DOSFileEntry entry;
+                entry.fp = fp;
+                entry.hostPath = hostPath;
+                entry.dosPath = dosPath;
+                entry.mode = 2; // r/w
+                dosFs.handles[handle] = entry;
+                dosFs.filesOpened++;
+                cpu.regs[0] = (uint16_t)handle; // AX = handle
+                cpu.setFlag(CPU::CF, false);
+            }
+            break;
+        }
+        case 0x3D: { // Open file
+            if (!dosFs.enabled) {
+                cpu.setFlag(CPU::CF, true);
+                cpu.regs[0] = 2; // file not found
+                dosFs.errors++;
+                break;
+            }
+            {
+                string dosPath = readDosString(mem, cpu.sregs[3], cpu.regs[2]);
+                uint8_t mode = cpu.getReg8(0); // AL = access mode
+                bool pathError = false;
+                string hostPath = resolveDosPath(dosFs, dosPath, pathError);
+                if (pathError) {
+                    cpu.setFlag(CPU::CF, true);
+                    cpu.regs[0] = 3; // path not found
+                    dosFs.errors++;
+                    break;
+                }
+                const char* fmode;
+                uint8_t dosMode = mode & 0x03;
+                if (dosMode == 0) fmode = "rb";       // read-only
+                else if (dosMode == 1) fmode = "r+b";  // write-only (open existing)
+                else fmode = "r+b";                     // read/write
+                FILE* fp = fopen(hostPath.c_str(), fmode);
+                if (!fp) {
+                    cpu.setFlag(CPU::CF, true);
+                    cpu.regs[0] = 2; // file not found
+                    dosFs.errors++;
+                    break;
+                }
+                int handle = dosFs.nextHandle++;
+                DOSFileEntry entry;
+                entry.fp = fp;
+                entry.hostPath = hostPath;
+                entry.dosPath = dosPath;
+                entry.mode = dosMode;
+                dosFs.handles[handle] = entry;
+                dosFs.filesOpened++;
+                cpu.regs[0] = (uint16_t)handle; // AX = handle
+                cpu.setFlag(CPU::CF, false);
+            }
+            break;
+        }
+        case 0x3E: { // Close file
+            {
+                int handle = (int)cpu.regs[3]; // BX
+                auto it = dosFs.handles.find(handle);
+                if (it == dosFs.handles.end()) {
+                    cpu.setFlag(CPU::CF, true);
+                    cpu.regs[0] = 6; // invalid handle
+                    dosFs.errors++;
+                    break;
+                }
+                if (!it->second.isDevice && it->second.fp) {
+                    fclose(it->second.fp);
+                }
+                dosFs.handles.erase(it);
+                dosFs.filesClosed++;
+                cpu.setFlag(CPU::CF, false);
+            }
+            break;
+        }
+        case 0x3F: { // Read file/device
+            {
+                int handle = (int)cpu.regs[3]; // BX
+                uint16_t count = cpu.regs[1];  // CX = bytes to read
+                uint16_t seg = cpu.sregs[3];   // DS
+                uint16_t off = cpu.regs[2];    // DX = buffer offset
+                auto it = dosFs.handles.find(handle);
+                if (it == dosFs.handles.end()) {
+                    cpu.setFlag(CPU::CF, true);
+                    cpu.regs[0] = 6; // invalid handle
+                    dosFs.errors++;
+                    break;
+                }
+                if (it->second.isDevice) {
+                    // Handle 0 = STDIN: read from io.readChar()
+                    if (handle == 0) {
+                        uint16_t bytesRead = 0;
+                        for (uint16_t i = 0; i < count; i++) {
+                            int ch = io.readChar();
+                            if (ch < 0) break;
+                            mem.swrite8(seg, (uint16_t)(off + i), (uint8_t)ch);
+                            bytesRead++;
+                            if (ch == 0x0D || ch == 0x0A) { bytesRead++; break; } // line-oriented
+                        }
+                        cpu.regs[0] = bytesRead;
+                        dosFs.bytesRead += bytesRead;
+                    } else {
+                        // Other device handles: return 0 bytes
+                        cpu.regs[0] = 0;
+                    }
+                    cpu.setFlag(CPU::CF, false);
+                } else {
+                    if (!it->second.fp) {
+                        cpu.setFlag(CPU::CF, true);
+                        cpu.regs[0] = 6;
+                        dosFs.errors++;
+                        break;
+                    }
+                    // Read into a temp buffer, then write to emulator memory
+                    vector<uint8_t> buf(count);
+                    size_t got = fread(buf.data(), 1, count, it->second.fp);
+                    for (size_t i = 0; i < got; i++) {
+                        mem.swrite8(seg, (uint16_t)(off + i), buf[i]);
+                    }
+                    cpu.regs[0] = (uint16_t)got; // AX = bytes actually read
+                    dosFs.bytesRead += (int)got;
+                    cpu.setFlag(CPU::CF, false);
+                }
+            }
+            break;
+        }
+        case 0x40: { // Write file/device
+            {
+                int handle = (int)cpu.regs[3]; // BX
+                uint16_t count = cpu.regs[1];  // CX = bytes to write
+                uint16_t seg = cpu.sregs[3];   // DS
+                uint16_t off = cpu.regs[2];    // DX = buffer offset
+                auto it = dosFs.handles.find(handle);
+                if (it == dosFs.handles.end()) {
+                    cpu.setFlag(CPU::CF, true);
+                    cpu.regs[0] = 6; // invalid handle
+                    dosFs.errors++;
+                    break;
+                }
+                if (it->second.isDevice) {
+                    // Handles 1,2 = STDOUT/STDERR: append to stdout capture
+                    if (handle == 1 || handle == 2) {
+                        for (uint16_t i = 0; i < count; i++) {
+                            uint8_t ch = mem.sread8(seg, (uint16_t)(off + i));
+                            if ((int)io.stdoutBuf.size() < MAX_OUTPUT) {
+                                io.stdoutBuf += (char)ch;
+                            }
+                            ttyCharToVRAM(mem, vram, ch);
+                        }
+                    }
+                    // Handle 0 (stdin write), 3 (AUX), 4 (PRN): silently discard
+                    cpu.regs[0] = count; // AX = bytes written
+                    dosFs.bytesWritten += count;
+                    cpu.setFlag(CPU::CF, false);
+                } else {
+                    if (!it->second.fp) {
+                        cpu.setFlag(CPU::CF, true);
+                        cpu.regs[0] = 6;
+                        dosFs.errors++;
+                        break;
+                    }
+                    // Read from emulator memory into temp buffer, then write to file
+                    vector<uint8_t> buf(count);
+                    for (uint16_t i = 0; i < count; i++) {
+                        buf[i] = mem.sread8(seg, (uint16_t)(off + i));
+                    }
+                    size_t wrote = fwrite(buf.data(), 1, count, it->second.fp);
+                    fflush(it->second.fp);
+                    cpu.regs[0] = (uint16_t)wrote; // AX = bytes written
+                    dosFs.bytesWritten += (int)wrote;
+                    cpu.setFlag(CPU::CF, false);
+                }
+            }
+            break;
+        }
+        case 0x42: { // Seek (lseek)
+            {
+                int handle = (int)cpu.regs[3]; // BX
+                uint8_t origin = cpu.getReg8(0); // AL = origin (0=start, 1=cur, 2=end)
+                int32_t offset = (int32_t)(((uint32_t)cpu.regs[1] << 16) | cpu.regs[2]); // CX:DX
+                auto it = dosFs.handles.find(handle);
+                if (it == dosFs.handles.end() || it->second.isDevice || !it->second.fp) {
+                    cpu.setFlag(CPU::CF, true);
+                    cpu.regs[0] = 6; // invalid handle
+                    dosFs.errors++;
+                    break;
+                }
+                int whence;
+                if (origin == 0) whence = SEEK_SET;
+                else if (origin == 1) whence = SEEK_CUR;
+                else whence = SEEK_END;
+                if (fseek(it->second.fp, offset, whence) != 0) {
+                    cpu.setFlag(CPU::CF, true);
+                    cpu.regs[0] = 1; // invalid function
+                    dosFs.errors++;
+                    break;
+                }
+                long pos = ftell(it->second.fp);
+                cpu.regs[2] = (uint16_t)(pos & 0xFFFF);         // DX:AX = new position
+                cpu.regs[0] = (uint16_t)((pos >> 16) & 0xFFFF);
+                // Note: DOS returns new pos in DX:AX but convention is DX=high, AX=low
+                // Correction: AX=low word, DX=high word
+                cpu.regs[0] = (uint16_t)(pos & 0xFFFF);  // AX = low
+                cpu.regs[2] = (uint16_t)((pos >> 16) & 0xFFFF); // DX = high
+                cpu.setFlag(CPU::CF, false);
+            }
+            break;
+        }
+        case 0x43: { // Get/set file attributes
+            {
+                uint8_t al = cpu.getReg8(0);
+                if (al == 0) { // Get attributes
+                    if (!dosFs.enabled) {
+                        cpu.setFlag(CPU::CF, true);
+                        cpu.regs[0] = 2;
+                        dosFs.errors++;
+                        break;
+                    }
+                    string dosPath = readDosString(mem, cpu.sregs[3], cpu.regs[2]);
+                    bool pathError = false;
+                    string hostPath = resolveDosPath(dosFs, dosPath, pathError);
+                    namespace fs = std::filesystem;
+                    if (pathError || !fs::exists(hostPath)) {
+                        cpu.setFlag(CPU::CF, true);
+                        cpu.regs[0] = 2; // file not found
+                        dosFs.errors++;
+                        break;
+                    }
+                    uint16_t attrs = 0x20; // Archive bit
+                    if (fs::is_directory(hostPath)) attrs = 0x10; // Directory
+                    cpu.regs[1] = attrs; // CX = attributes
+                    cpu.setFlag(CPU::CF, false);
+                } else { // Set attributes - stub (succeed silently)
+                    cpu.setFlag(CPU::CF, false);
+                }
+            }
+            break;
+        }
+        case 0x44: { // IOCTL
+            {
+                uint8_t al = cpu.getReg8(0);
+                if (al == 0x00) { // Get device info
+                    int handle = (int)cpu.regs[3]; // BX
+                    auto it = dosFs.handles.find(handle);
+                    if (it == dosFs.handles.end()) {
+                        cpu.setFlag(CPU::CF, true);
+                        cpu.regs[0] = 6; // invalid handle
+                        dosFs.errors++;
+                        break;
+                    }
+                    uint16_t info = 0;
+                    if (it->second.isDevice) {
+                        info = 0x80; // bit 7 = is device
+                        if (handle == 0) info |= 0x01; // STDIN
+                        if (handle == 1 || handle == 2) info |= 0x02; // STDOUT
+                    }
+                    // For files: info = 0 (block device, not EOF, etc.)
+                    cpu.regs[2] = info; // DX = device info word
+                    cpu.setFlag(CPU::CF, false);
+                } else {
+                    // Other IOCTL subfunctions: stub
+                    cpu.setFlag(CPU::CF, true);
+                    cpu.regs[0] = 1; // invalid function
+                }
+            }
+            break;
+        }
+        case 0x47: { // Get current directory
+            {
+                // DS:SI = buffer to receive path (64 bytes max, no drive letter, no leading backslash)
+                uint16_t seg = cpu.sregs[3]; // DS
+                uint16_t off = cpu.regs[6];  // SI
+                string dir = dosFs.currentDir;
+                // Convert forward slashes to backslashes for DOS
+                for (char& c : dir) { if (c == '/') c = '\\'; }
+                // Write to emulator memory (no leading backslash, null-terminated)
+                for (size_t i = 0; i < dir.size() && i < 63; i++) {
+                    mem.swrite8(seg, (uint16_t)(off + i), (uint8_t)dir[i]);
+                }
+                mem.swrite8(seg, (uint16_t)(off + dir.size()), 0); // null terminator
+                cpu.setFlag(CPU::CF, false);
+            }
+            break;
+        }
+        case 0x4C: { // Exit with AL as exit code
+            io.exitCode = cpu.getReg8(0); // AL
+            result.halted = true;
+            result.haltReason = "INT 21h/4Ch exit (code=" + to_string(io.exitCode) + ")";
+            result.exitCode = io.exitCode;
+            break;
+        }
+        case 0x4E: { // FindFirst - find first matching file
+            if (!dosFs.enabled) {
+                cpu.setFlag(CPU::CF, true);
+                cpu.regs[0] = 2; // file not found
+                dosFs.errors++;
+                break;
+            }
+            {
+                namespace fs = std::filesystem;
+                string dosPath = readDosString(mem, cpu.sregs[3], cpu.regs[2]);
+                uint16_t searchAttr = cpu.regs[1]; // CX = attribute mask
+                dosFs.dirSearches++;
+
+                // Split path into directory + wildcard pattern
+                string pathCopy = dosPath;
+                for (char& c : pathCopy) { if (c == '\\') c = '/'; }
+                string dirPart, patternPart;
+                size_t lastSlash = pathCopy.rfind('/');
+                if (lastSlash != string::npos) {
+                    dirPart = pathCopy.substr(0, lastSlash);
+                    patternPart = pathCopy.substr(lastSlash + 1);
+                } else {
+                    patternPart = pathCopy;
+                }
+                // Uppercase the pattern
+                for (char& c : patternPart) c = (char)toupper((unsigned char)c);
+
+                // Resolve the directory part
+                string searchDir;
+                if (dirPart.empty()) {
+                    // Search in current directory
+                    if (dosFs.currentDir.empty()) {
+                        searchDir = dosFs.rootPath;
+                    } else {
+                        searchDir = dosFs.rootPath + "/" + dosFs.currentDir;
+                    }
+                } else {
+                    bool pathError = false;
+                    searchDir = resolveDosPath(dosFs, dirPart, pathError);
+                    if (pathError || !fs::is_directory(searchDir)) {
+                        cpu.setFlag(CPU::CF, true);
+                        cpu.regs[0] = 3; // path not found
+                        dosFs.errors++;
+                        break;
+                    }
+                }
+
+                // Enumerate directory and filter
+                DOSSearchState search;
+                search.searchAttr = (uint8_t)(searchAttr & 0xFF);
+                search.pattern = patternPart;
+                try {
+                    for (auto& dirEntry : fs::directory_iterator(searchDir)) {
+                        string fname = dirEntry.path().filename().string();
+                        string shortName = toShortName(fname);
+                        bool isDir = dirEntry.is_directory();
+                        // Filter by attribute: directories only included if attr bit 0x10 set
+                        if (isDir && !(searchAttr & 0x10)) continue;
+                        // Skip hidden/system files (names starting with '.')
+                        if (!fname.empty() && fname[0] == '.') continue;
+                        // Match against wildcard pattern
+                        if (matchesDosWildcard(shortName, patternPart)) {
+                            search.entries.push_back({dirEntry.path().string(), shortName});
+                        }
+                    }
+                } catch (...) {
+                    cpu.setFlag(CPU::CF, true);
+                    cpu.regs[0] = 3; // path not found
+                    dosFs.errors++;
+                    break;
+                }
+
+                if (search.entries.empty()) {
+                    cpu.setFlag(CPU::CF, true);
+                    cpu.regs[0] = 18; // no more files
+                    break;
+                }
+
+                // Store search state and get index
+                search.nextIndex = 1; // first entry consumed now
+                size_t searchId = dosFs.searches.size();
+                dosFs.searches.push_back(search);
+
+                // Write first match to DTA
+                auto& firstEntry = search.entries[0];
+                string& hostEntryPath = firstEntry.first;
+                string& dosName = firstEntry.second;
+
+                // Get file info
+                uint32_t fileSize = 0;
+                uint16_t dosDate = 0, dosTime = 0;
+                uint8_t fileAttr = 0x20; // Archive
+                try {
+                    auto stat = fs::status(hostEntryPath);
+                    if (fs::is_directory(stat)) fileAttr = 0x10;
+                    if (fs::is_regular_file(stat)) fileSize = (uint32_t)fs::file_size(hostEntryPath);
+                    auto ftime = fs::last_write_time(hostEntryPath);
+                    toDosDateTime(ftime, dosDate, dosTime);
+                } catch (...) {}
+
+                // Write DTA (43 bytes)
+                uint16_t dtaSeg = dosFs.dtaSegment;
+                uint16_t dtaOff = dosFs.dtaOffset;
+                // Bytes 0-20: reserved (store search ID as uint16_t at offset 0)
+                for (int i = 0; i < 21; i++) mem.swrite8(dtaSeg, (uint16_t)(dtaOff + i), 0);
+                mem.swrite8(dtaSeg, dtaOff, (uint8_t)(searchId & 0xFF));
+                mem.swrite8(dtaSeg, (uint16_t)(dtaOff + 1), (uint8_t)((searchId >> 8) & 0xFF));
+                // Byte 0x15: file attribute
+                mem.swrite8(dtaSeg, (uint16_t)(dtaOff + 0x15), fileAttr);
+                // Bytes 0x16-0x17: file time
+                mem.swrite8(dtaSeg, (uint16_t)(dtaOff + 0x16), (uint8_t)(dosTime & 0xFF));
+                mem.swrite8(dtaSeg, (uint16_t)(dtaOff + 0x17), (uint8_t)(dosTime >> 8));
+                // Bytes 0x18-0x19: file date
+                mem.swrite8(dtaSeg, (uint16_t)(dtaOff + 0x18), (uint8_t)(dosDate & 0xFF));
+                mem.swrite8(dtaSeg, (uint16_t)(dtaOff + 0x19), (uint8_t)(dosDate >> 8));
+                // Bytes 0x1A-0x1D: file size (DWORD little-endian)
+                mem.swrite8(dtaSeg, (uint16_t)(dtaOff + 0x1A), (uint8_t)(fileSize & 0xFF));
+                mem.swrite8(dtaSeg, (uint16_t)(dtaOff + 0x1B), (uint8_t)((fileSize >> 8) & 0xFF));
+                mem.swrite8(dtaSeg, (uint16_t)(dtaOff + 0x1C), (uint8_t)((fileSize >> 16) & 0xFF));
+                mem.swrite8(dtaSeg, (uint16_t)(dtaOff + 0x1D), (uint8_t)((fileSize >> 24) & 0xFF));
+                // Bytes 0x1E-0x2A: filename (ASCIIZ, 13 bytes max)
+                for (size_t i = 0; i < dosName.size() && i < 12; i++) {
+                    mem.swrite8(dtaSeg, (uint16_t)(dtaOff + 0x1E + i), (uint8_t)dosName[i]);
+                }
+                mem.swrite8(dtaSeg, (uint16_t)(dtaOff + 0x1E + min(dosName.size(), (size_t)12)), 0);
+
+                cpu.setFlag(CPU::CF, false);
+            }
+            break;
+        }
+        case 0x4F: { // FindNext - find next matching file
+            {
+                // Read search ID from DTA reserved bytes
+                uint16_t dtaSeg = dosFs.dtaSegment;
+                uint16_t dtaOff = dosFs.dtaOffset;
+                uint16_t searchId = mem.sread8(dtaSeg, dtaOff) |
+                                    ((uint16_t)mem.sread8(dtaSeg, (uint16_t)(dtaOff + 1)) << 8);
+
+                if (searchId >= dosFs.searches.size()) {
+                    cpu.setFlag(CPU::CF, true);
+                    cpu.regs[0] = 18; // no more files
+                    break;
+                }
+
+                DOSSearchState& search = dosFs.searches[searchId];
+                if (search.nextIndex >= search.entries.size()) {
+                    cpu.setFlag(CPU::CF, true);
+                    cpu.regs[0] = 18; // no more files
+                    break;
+                }
+
+                namespace fs = std::filesystem;
+                auto& entry = search.entries[search.nextIndex];
+                search.nextIndex++;
+
+                string& hostEntryPath = entry.first;
+                string& dosName = entry.second;
+
+                uint32_t fileSize = 0;
+                uint16_t dosDate = 0, dosTime = 0;
+                uint8_t fileAttr = 0x20;
+                try {
+                    auto stat = fs::status(hostEntryPath);
+                    if (fs::is_directory(stat)) fileAttr = 0x10;
+                    if (fs::is_regular_file(stat)) fileSize = (uint32_t)fs::file_size(hostEntryPath);
+                    auto ftime = fs::last_write_time(hostEntryPath);
+                    toDosDateTime(ftime, dosDate, dosTime);
+                } catch (...) {}
+
+                // Write DTA
+                // Preserve search ID in reserved bytes, update the rest
+                mem.swrite8(dtaSeg, (uint16_t)(dtaOff + 0x15), fileAttr);
+                mem.swrite8(dtaSeg, (uint16_t)(dtaOff + 0x16), (uint8_t)(dosTime & 0xFF));
+                mem.swrite8(dtaSeg, (uint16_t)(dtaOff + 0x17), (uint8_t)(dosTime >> 8));
+                mem.swrite8(dtaSeg, (uint16_t)(dtaOff + 0x18), (uint8_t)(dosDate & 0xFF));
+                mem.swrite8(dtaSeg, (uint16_t)(dtaOff + 0x19), (uint8_t)(dosDate >> 8));
+                mem.swrite8(dtaSeg, (uint16_t)(dtaOff + 0x1A), (uint8_t)(fileSize & 0xFF));
+                mem.swrite8(dtaSeg, (uint16_t)(dtaOff + 0x1B), (uint8_t)((fileSize >> 8) & 0xFF));
+                mem.swrite8(dtaSeg, (uint16_t)(dtaOff + 0x1C), (uint8_t)((fileSize >> 16) & 0xFF));
+                mem.swrite8(dtaSeg, (uint16_t)(dtaOff + 0x1D), (uint8_t)((fileSize >> 24) & 0xFF));
+                // Clear and write filename
+                for (int i = 0; i < 13; i++) mem.swrite8(dtaSeg, (uint16_t)(dtaOff + 0x1E + i), 0);
+                for (size_t i = 0; i < dosName.size() && i < 12; i++) {
+                    mem.swrite8(dtaSeg, (uint16_t)(dtaOff + 0x1E + i), (uint8_t)dosName[i]);
+                }
+
+                cpu.setFlag(CPU::CF, false);
+            }
+            break;
+        }
+        case 0x57: { // Get/set file date and time
+            {
+                uint8_t al = cpu.getReg8(0);
+                int handle = (int)cpu.regs[3]; // BX
+                auto it = dosFs.handles.find(handle);
+                if (it == dosFs.handles.end()) {
+                    cpu.setFlag(CPU::CF, true);
+                    cpu.regs[0] = 6; // invalid handle
+                    dosFs.errors++;
+                    break;
+                }
+                if (al == 0x00) { // Get file date/time
+                    namespace fs = std::filesystem;
+                    if (it->second.isDevice || it->second.hostPath.empty()) {
+                        cpu.regs[1] = 0; // CX = time
+                        cpu.regs[2] = 0; // DX = date
+                    } else {
+                        try {
+                            auto ftime = fs::last_write_time(it->second.hostPath);
+                            uint16_t dosDate, dosTime;
+                            toDosDateTime(ftime, dosDate, dosTime);
+                            cpu.regs[1] = dosTime; // CX = time
+                            cpu.regs[2] = dosDate; // DX = date
+                        } catch (...) {
+                            cpu.regs[1] = 0;
+                            cpu.regs[2] = 0;
+                        }
+                    }
+                    cpu.setFlag(CPU::CF, false);
+                } else { // Set file date/time - stub (succeed silently)
+                    cpu.setFlag(CPU::CF, false);
+                }
+            }
+            break;
+        }
+        case 0x62: { // Get PSP segment
+            cpu.regs[3] = 0; // BX = PSP segment (we use segment 0)
+            cpu.setFlag(CPU::CF, false);
             break;
         }
         default: {
@@ -3622,15 +4991,133 @@ void handleInt21(CPU& cpu, Memory& mem, IOCapture& io, EmulatorResult& result, V
     }
 }
 
-void handleInterrupt(CPU& cpu, Memory& mem, IOCapture& io, EmulatorResult& result, uint8_t intNum, VRAMState& vram) {
+void handleInt33(CPU& cpu, MouseState& mouse, EmulatorResult& result,
+                 EventState& evState, Memory& mem, IOCapture& io,
+                 const vector<uint8_t>& code, const EmulatorConfig& config,
+                 const VRAMState& vram, int cycle) {
+    uint16_t func = cpu.regs[0]; // INT 33h dispatches on full AX
+    if (!mouse.installed) {
+        // Driver not installed — return AX=0 for reset/detect, skip everything else
+        if (func == 0x0000) {
+            cpu.regs[0] = 0x0000; // not installed
+            cpu.regs[3] = 0;     // BX = 0 buttons
+        }
+        return;
+    }
+    evState.counters.int33Count++;
+    switch (func) {
+        case 0x0000: // Reset/detect
+            cpu.regs[0] = 0xFFFF; // installed
+            cpu.regs[3] = 3;     // BX = 3 buttons
+            mouse.x = (mouse.minX + mouse.maxX) / 2;
+            mouse.y = (mouse.minY + mouse.maxY) / 2;
+            mouse.visible = false;
+            mouse.buttons = 0;
+            for (int i = 0; i < 3; i++) { mouse.pressCount[i] = 0; mouse.releaseCount[i] = 0; }
+            break;
+        case 0x0001: // Show cursor
+            mouse.visible = true;
+            break;
+        case 0x0002: // Hide cursor
+            mouse.visible = false;
+            break;
+        case 0x0003: // Get position and button status
+            evState.counters.pollCount++;
+            processEvents(evState, cycle, mouse, io, result, cpu, mem, code, config, vram);
+            cpu.regs[3] = mouse.buttons;   // BX
+            cpu.regs[1] = (uint16_t)mouse.x; // CX
+            cpu.regs[2] = (uint16_t)mouse.y; // DX
+            break;
+        case 0x0004: { // Set cursor position
+            int16_t nx = (int16_t)cpu.regs[1]; // CX
+            int16_t ny = (int16_t)cpu.regs[2]; // DX
+            if (nx < mouse.minX) nx = mouse.minX;
+            if (nx > mouse.maxX) nx = mouse.maxX;
+            if (ny < mouse.minY) ny = mouse.minY;
+            if (ny > mouse.maxY) ny = mouse.maxY;
+            mouse.x = nx;
+            mouse.y = ny;
+            break;
+        }
+        case 0x0005: { // Get button press info
+            int btn = cpu.regs[3] & 3; // BX = button index
+            if (btn < 3) {
+                cpu.regs[3] = mouse.pressCount[btn]; // BX = count
+                mouse.pressCount[btn] = 0;
+            } else {
+                cpu.regs[3] = 0;
+            }
+            cpu.regs[0] = mouse.buttons; // AX = current button state
+            cpu.regs[1] = (uint16_t)mouse.x; // CX = last press x
+            cpu.regs[2] = (uint16_t)mouse.y; // DX = last press y
+            break;
+        }
+        case 0x0006: { // Get button release info
+            int btn = cpu.regs[3] & 3; // BX = button index
+            if (btn < 3) {
+                cpu.regs[3] = mouse.releaseCount[btn]; // BX = count
+                mouse.releaseCount[btn] = 0;
+            } else {
+                cpu.regs[3] = 0;
+            }
+            cpu.regs[0] = mouse.buttons; // AX = current button state
+            cpu.regs[1] = (uint16_t)mouse.x; // CX = last release x
+            cpu.regs[2] = (uint16_t)mouse.y; // DX = last release y
+            break;
+        }
+        case 0x0007: // Set horizontal range
+            mouse.minX = (int16_t)cpu.regs[1]; // CX
+            mouse.maxX = (int16_t)cpu.regs[2]; // DX
+            if (mouse.x < mouse.minX) mouse.x = mouse.minX;
+            if (mouse.x > mouse.maxX) mouse.x = mouse.maxX;
+            break;
+        case 0x0008: // Set vertical range
+            mouse.minY = (int16_t)cpu.regs[1]; // CX
+            mouse.maxY = (int16_t)cpu.regs[2]; // DX
+            if (mouse.y < mouse.minY) mouse.y = mouse.minY;
+            if (mouse.y > mouse.maxY) mouse.y = mouse.maxY;
+            break;
+        case 0x000B: // Get motion counters
+            cpu.regs[1] = 0; // CX = horizontal mickeys
+            cpu.regs[2] = 0; // DX = vertical mickeys
+            break;
+        case 0x000C: // Set event handler — silently ignored
+            break;
+        default:
+            result.skipped.push_back({ cpu.ip, "INT 33h AX=" + hexImm16(func), "Unimplemented mouse function", 1 });
+            break;
+    }
+}
+
+// --- INT 16h: BIOS Keyboard Services ---
+void handleInt16(CPU& cpu, IOCapture& io, EmulatorResult& result) {
+    uint8_t ah = cpu.getReg8(4); // AH
+    switch (ah) {
+        case 0x02: // Get shift flags
+            cpu.setReg8(0, io.shiftFlags); // AL = shift flags byte
+            break;
+        default:
+            result.skipped.push_back({ cpu.ip, "INT 16h AH=" + hexByte(ah), "Unimplemented keyboard function", 1 });
+            break;
+    }
+}
+
+void handleInterrupt(CPU& cpu, Memory& mem, IOCapture& io, EmulatorResult& result,
+                     uint8_t intNum, VRAMState& vram, MouseState& mouse,
+                     EventState& evState, const vector<uint8_t>& code,
+                     const EmulatorConfig& config, int cycle, DOSFileState& dosFs) {
     if (intNum == 0x20) {
         result.halted = true;
         result.haltReason = "INT 20h program terminate";
         result.exitCode = 0;
     } else if (intNum == 0x21) {
-        handleInt21(cpu, mem, io, result, vram);
+        handleInt21(cpu, mem, io, result, vram, evState, mouse, code, config, cycle, dosFs);
     } else if (intNum == 0x10) {
         handleInt10(cpu, mem, vram, result);
+    } else if (intNum == 0x16) {
+        handleInt16(cpu, io, result);
+    } else if (intNum == 0x33) {
+        handleInt33(cpu, mouse, result, evState, mem, io, code, config, vram, cycle);
     } else {
         result.skipped.push_back({ cpu.ip, "INT " + hexByte(intNum), "Unimplemented interrupt", 1 });
     }
@@ -3639,7 +5126,8 @@ void handleInterrupt(CPU& cpu, Memory& mem, IOCapture& io, EmulatorResult& resul
 // --- Section 4: Instruction Execution ---
 
 void executeInstruction(CPU& cpu, Memory& mem, IOCapture& io, const DecodedInst& inst,
-                        EmulatorResult& result, vector<uint8_t>& code, bool& memDirty, VRAMState& vram) {
+                        EmulatorResult& result, vector<uint8_t>& code, bool& memDirty, VRAMState& vram, MouseState& mouse,
+                        EventState& evState, const EmulatorConfig& config, int cycle, DOSFileState& dosFs) {
     const string& mn = inst.mnemonic;
 
     // --- ALU: ADD, ADC, SUB, SBB, CMP, AND, OR, XOR, TEST ---
@@ -4134,7 +5622,7 @@ void executeInstruction(CPU& cpu, Memory& mem, IOCapture& io, const DecodedInst&
     // --- INT ---
     else if (mn == "INT") {
         uint8_t intNum = (uint8_t)(inst.op1.disp & 0xFF);
-        handleInterrupt(cpu, mem, io, result, intNum, vram);
+        handleInterrupt(cpu, mem, io, result, intNum, vram, mouse, evState, code, config, cycle, dosFs);
     }
 
     // --- IN / OUT ---
@@ -4288,16 +5776,57 @@ double computeFidelity(const EmulatorResult& result) {
 
 void captureViewport(const Memory& mem, const EmulatorConfig& config,
                      vector<string>& textOut, vector<string>& attrOut); // Moved up
-static bool writeScreenshotBMP(const uint8_t vram[8000],
-                                const string& filename, bool use8x8); // Forward decl
+static bool writeScreenshot(const uint8_t vram[16000],
+                            const string& filename, bool use8x8); // Forward decl
 
 EmulatorResult runEmulator(const vector<uint8_t>& binary, const EmulatorConfig& config, CPU& cpuOut) {
     EmulatorResult result;
     CPU cpu;
     Memory mem;
     VRAMState vram;
+    MouseState mouse;
     IOCapture io;
     io.stdinSource = config.stdinInput;
+
+    // Init mouse
+    if (config.mouseEnabled) {
+        mouse.installed = true;
+        mouse.x = (int16_t)config.mouseX;
+        mouse.y = (int16_t)config.mouseY;
+        mouse.buttons = config.mouseButtons;
+        // Clamp to default range
+        if (mouse.x < mouse.minX) mouse.x = mouse.minX;
+        if (mouse.x > mouse.maxX) mouse.x = mouse.maxX;
+        if (mouse.y < mouse.minY) mouse.y = mouse.minY;
+        if (mouse.y > mouse.maxY) mouse.y = mouse.maxY;
+        // Pre-populate press counts for buttons that are down
+        for (int i = 0; i < 3; i++) {
+            if (mouse.buttons & (1 << i)) mouse.pressCount[i] = 1;
+        }
+    }
+
+    // Init events
+    EventState evState;
+    evState.events = config.events;
+
+    // Init DOS file state
+    DOSFileState dosFs;
+    // Always pre-populate device handles (0-4) so AH=40h stdout works without --dos-root
+    for (int h = 0; h < 5; h++) {
+        DOSFileEntry dev;
+        dev.isDevice = true;
+        dev.mode = 2; // r/w
+        dosFs.handles[h] = dev;
+    }
+    if (!config.dosRoot.empty()) {
+        namespace fs = std::filesystem;
+        try {
+            dosFs.rootPath = fs::canonical(config.dosRoot).string();
+            dosFs.enabled = true;
+        } catch (const fs::filesystem_error&) {
+            // rootPath not valid - dosFs.enabled stays false
+        }
+    }
 
     // Init CPU
     cpu.ip = 0x100;
@@ -4307,6 +5836,25 @@ EmulatorResult runEmulator(const vector<uint8_t>& binary, const EmulatorConfig& 
 
     // Init VRAM
     vram.clearScreen(mem);
+
+    // Apply --vram-fill if requested
+    if (config.vramFill) {
+        const int totalCells = vram.cols * vram.rows;  // 80*50 = 4000
+        if (config.vramFillText.empty()) {
+            // Random fill with printable characters
+            static const char charset[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%&*+-=.:~ ";
+            srand((unsigned)time(nullptr));
+            for (int i = 0; i < totalCells; i++) {
+                mem.vram[i * 2] = charset[rand() % (sizeof(charset) - 1)];
+            }
+        } else {
+            // Tile the provided text across all character cells
+            const string& txt = config.vramFillText;
+            for (int i = 0; i < totalCells; i++) {
+                mem.vram[i * 2] = (uint8_t)txt[i % txt.size()];
+            }
+        }
+    }
 
     // Load binary and PSP INT 20h
     mem.loadCOM(binary);
@@ -4347,8 +5895,12 @@ EmulatorResult runEmulator(const vector<uint8_t>& binary, const EmulatorConfig& 
         cpu.ip = (uint16_t)(cpu.ip + inst.size);
 
         // Execute
-        executeInstruction(cpu, mem, io, inst, result, code, memDirty, vram);
+        executeInstruction(cpu, mem, io, inst, result, code, memDirty, vram, mouse, evState, config, cycle, dosFs);
         cycle++;
+
+        // Process tick-based events
+        evState.counters.tickCount = cycle;
+        processEvents(evState, cycle, mouse, io, result, cpu, mem, code, config, vram);
 
         if (result.halted) break;
 
@@ -4363,6 +5915,23 @@ EmulatorResult runEmulator(const vector<uint8_t>& binary, const EmulatorConfig& 
         result.haltReason = "Cycle limit reached (" + to_string(config.maxCycles) + ")";
     }
 
+    // Populate event log
+    result.eventsTotal = (int)evState.events.size();
+    for (auto& ev : evState.events) {
+        if (ev.fired) {
+            result.eventsFired++;
+            EmulatorResult::EventLogEntry entry;
+            entry.on = ev.triggerType + ":" + to_string(ev.triggerCount);
+            entry.cycle = ev.firedAtCycle;
+            string acts;
+            if (ev.hasMouse) acts += "mouse [" + to_string(ev.mouseX) + "," + to_string(ev.mouseY) + "," + to_string(ev.mouseButtons) + "]";
+            if (ev.hasKeys) { if (!acts.empty()) acts += ", "; acts += "keys \"" + ev.keys + "\""; }
+            if (ev.snapshot) { if (!acts.empty()) acts += ", "; acts += "snapshot"; }
+            entry.action = acts;
+            result.eventLog.push_back(entry);
+        }
+    }
+
     result.success = true;
     result.cyclesExecuted = cycle;
     result.output = io.stdoutBuf;
@@ -4373,14 +5942,36 @@ EmulatorResult runEmulator(const vector<uint8_t>& binary, const EmulatorConfig& 
     }
     result.cursorRow = vram.cursorRow;
     result.cursorCol = vram.cursorCol;
+    // Capture mouse state
+    if (mouse.installed) {
+        result.mouseEnabled = true;
+        result.mouseX = mouse.x;
+        result.mouseY = mouse.y;
+        result.mouseButtons = mouse.buttons;
+        result.mouseVisible = mouse.visible;
+    }
     // Write screenshot if requested
     if (!config.screenshotFile.empty()) {
-        if (writeScreenshotBMP(mem.vram, config.screenshotFile, config.screenshotFont8x8)) {
+        if (writeScreenshot(mem.vram, config.screenshotFile, config.screenshotFont8x8)) {
             result.screenshotPath = config.screenshotFile;
         } else {
             result.diagnostics.push_back("Failed to write screenshot: " + config.screenshotFile);
         }
     }
+    // Close any open DOS file handles and populate file I/O stats
+    for (auto& kv : dosFs.handles) {
+        if (!kv.second.isDevice && kv.second.fp) {
+            fclose(kv.second.fp);
+            kv.second.fp = nullptr;
+        }
+    }
+    result.fileIO.filesOpened = dosFs.filesOpened;
+    result.fileIO.filesClosed = dosFs.filesClosed;
+    result.fileIO.bytesRead = dosFs.bytesRead;
+    result.fileIO.bytesWritten = dosFs.bytesWritten;
+    result.fileIO.dirSearches = dosFs.dirSearches;
+    result.fileIO.errors = dosFs.errors;
+
     cpuOut = cpu;
     return result;
 }
@@ -4433,7 +6024,15 @@ void emitEmulatorJSON(const EmulatorResult& result, const CPU& cpu) {
     cout << "\"IF\": " << cpu.getFlag(CPU::IF_);
     cout << "}" << "," << endl;
     cout << "    \"cursor\": {\"row\": " << result.cursorRow
-         << ", \"col\": " << result.cursorCol << "}" << endl;
+         << ", \"col\": " << result.cursorCol << "}";
+    if (result.mouseEnabled) {
+        cout << "," << endl;
+        cout << "    \"mouse\": {\"x\": " << result.mouseX
+             << ", \"y\": " << result.mouseY
+             << ", \"buttons\": " << result.mouseButtons
+             << ", \"visible\": " << (result.mouseVisible ? "true" : "false") << "}";
+    }
+    cout << endl;
     cout << "  }," << endl;
 
     // Snapshots
@@ -4508,9 +6107,41 @@ void emitEmulatorJSON(const EmulatorResult& result, const CPU& cpu) {
     }
     cout << "  ]";
 
+    // Events (conditional)
+    if (result.eventsTotal > 0) {
+        cout << "," << endl;
+        cout << "  \"events\": {" << endl;
+        cout << "    \"total\": " << result.eventsTotal << "," << endl;
+        cout << "    \"fired\": " << result.eventsFired << "," << endl;
+        cout << "    \"pending\": " << (result.eventsTotal - result.eventsFired) << "," << endl;
+        cout << "    \"log\": [" << endl;
+        for (size_t i = 0; i < result.eventLog.size(); i++) {
+            const auto& e = result.eventLog[i];
+            cout << "      {\"on\": \"" << jsonEscape(e.on) << "\", \"cycle\": " << e.cycle
+                 << ", \"action\": \"" << jsonEscape(e.action) << "\"}";
+            if (i < result.eventLog.size() - 1) cout << ",";
+            cout << endl;
+        }
+        cout << "    ]" << endl;
+        cout << "  }";
+    }
+
+    // File I/O stats (conditional)
+    if (result.fileIO.filesOpened > 0 || result.fileIO.dirSearches > 0) {
+        cout << "," << endl;
+        cout << "  \"fileIO\": {" << endl;
+        cout << "    \"filesOpened\": " << result.fileIO.filesOpened << "," << endl;
+        cout << "    \"filesClosed\": " << result.fileIO.filesClosed << "," << endl;
+        cout << "    \"bytesRead\": " << result.fileIO.bytesRead << "," << endl;
+        cout << "    \"bytesWritten\": " << result.fileIO.bytesWritten << "," << endl;
+        cout << "    \"dirSearches\": " << result.fileIO.dirSearches << "," << endl;
+        cout << "    \"errors\": " << result.fileIO.errors << endl;
+        cout << "  }";
+    }
+
     // Screen (conditional)
     if (!result.screen.empty()) {
-        cout << "," << endl; 
+        cout << "," << endl;
         cout << "  \"screen\": [" << endl;
         for (size_t i = 0; i < result.screen.size(); i++) {
             cout << "    \"" << jsonEscape(result.screen[i]) << "\"";
@@ -4591,7 +6222,15 @@ void emitCombinedJSON(AssemblerContext& asmCtx, const EmulatorResult& emuResult,
     cout << "      \"IP\": \"" << hexImm16(cpu.ip) << "\"," << endl;
     cout << "      \"flags\": \"" << hexImm16(cpu.flags) << "\"," << endl;
     cout << "      \"cursor\": {\"row\": " << emuResult.cursorRow
-         << ", \"col\": " << emuResult.cursorCol << "}" << endl;
+         << ", \"col\": " << emuResult.cursorCol << "}";
+    if (emuResult.mouseEnabled) {
+        cout << "," << endl;
+        cout << "      \"mouse\": {\"x\": " << emuResult.mouseX
+             << ", \"y\": " << emuResult.mouseY
+             << ", \"buttons\": " << emuResult.mouseButtons
+             << ", \"visible\": " << (emuResult.mouseVisible ? "true" : "false") << "}";
+    }
+    cout << endl;
     cout << "    }," << endl;
 
     // Skipped
@@ -4602,6 +6241,38 @@ void emitCombinedJSON(AssemblerContext& asmCtx, const EmulatorResult& emuResult,
         if (i < emuResult.skipped.size() - 1) cout << ",";
     }
     cout << "]" << endl;
+
+    // Events (conditional)
+    if (emuResult.eventsTotal > 0) {
+        cout << "," << endl;
+        cout << "    \"events\": {" << endl;
+        cout << "      \"total\": " << emuResult.eventsTotal << "," << endl;
+        cout << "      \"fired\": " << emuResult.eventsFired << "," << endl;
+        cout << "      \"pending\": " << (emuResult.eventsTotal - emuResult.eventsFired) << "," << endl;
+        cout << "      \"log\": [" << endl;
+        for (size_t i = 0; i < emuResult.eventLog.size(); i++) {
+            const auto& e = emuResult.eventLog[i];
+            cout << "        {\"on\": \"" << jsonEscape(e.on) << "\", \"cycle\": " << e.cycle
+                 << ", \"action\": \"" << jsonEscape(e.action) << "\"}";
+            if (i < emuResult.eventLog.size() - 1) cout << ",";
+            cout << endl;
+        }
+        cout << "      ]" << endl;
+        cout << "    }";
+    }
+
+    // File I/O stats (conditional)
+    if (emuResult.fileIO.filesOpened > 0 || emuResult.fileIO.dirSearches > 0) {
+        cout << "," << endl;
+        cout << "    \"fileIO\": {" << endl;
+        cout << "      \"filesOpened\": " << emuResult.fileIO.filesOpened << "," << endl;
+        cout << "      \"filesClosed\": " << emuResult.fileIO.filesClosed << "," << endl;
+        cout << "      \"bytesRead\": " << emuResult.fileIO.bytesRead << "," << endl;
+        cout << "      \"bytesWritten\": " << emuResult.fileIO.bytesWritten << "," << endl;
+        cout << "      \"dirSearches\": " << emuResult.fileIO.dirSearches << "," << endl;
+        cout << "      \"errors\": " << emuResult.fileIO.errors << endl;
+        cout << "    }";
+    }
 
     // Screen (for Combined JSON)
     if (!emuResult.screen.empty()) {
@@ -4634,7 +6305,7 @@ void emitCombinedJSON(AssemblerContext& asmCtx, const EmulatorResult& emuResult,
 }
 
 // ============================================================
-// SCREENSHOT RENDERING — BMP OUTPUT
+// SCREENSHOT RENDERING — PNG / JPG / BMP OUTPUT
 // ============================================================
 
 static const uint8_t cgaPalette[16][3] = {
@@ -4646,34 +6317,24 @@ static const uint8_t cgaPalette[16][3] = {
 
 #include "cp437font.h"
 
-static bool writeScreenshotBMP(const uint8_t vram[8000],
-                                const string& filename, bool use8x8) {
+static string getExtLower(const string& filename) {
+    auto dot = filename.rfind('.');
+    if (dot == string::npos) return "";
+    string ext = filename.substr(dot);
+    transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    return ext;
+}
+
+static bool writeScreenshot(const uint8_t vram[16000],
+                            const string& filename, bool use8x8) {
     const uint8_t* font = use8x8 ? cp437_8x8 : cp437_8x16;
     const int GLYPH_H = use8x8 ? 8 : 16;
     const int IMG_W = 640;
     const int IMG_H = (use8x8 ? 400 : 800);
-    const int rowStride = IMG_W * 3;  // 1920, already 4-byte aligned
-    const int pixelDataSize = rowStride * IMG_H;
-    const int fileSize = 54 + pixelDataSize;
 
-    vector<uint8_t> bmp(fileSize);
-
-    // BMP file header (14 bytes)
-    bmp[0] = 'B'; bmp[1] = 'M';
-    bmp[2] = fileSize & 0xFF; bmp[3] = (fileSize >> 8) & 0xFF;
-    bmp[4] = (fileSize >> 16) & 0xFF; bmp[5] = (fileSize >> 24) & 0xFF;
-    bmp[10] = 54;  // pixel data offset
-
-    // DIB header — BITMAPINFOHEADER (40 bytes)
-    bmp[14] = 40;  // header size
-    bmp[18] = IMG_W & 0xFF; bmp[19] = (IMG_W >> 8) & 0xFF;
-    bmp[22] = IMG_H & 0xFF; bmp[23] = (IMG_H >> 8) & 0xFF;
-    bmp[26] = 1;   // color planes
-    bmp[28] = 24;  // bits per pixel
-
-    // Render VRAM cells
+    // Render VRAM to top-down RGB pixel buffer
+    vector<uint8_t> rgb(IMG_W * IMG_H * 3);
     for (int row = 0; row < 50; row++) {
-        // Skip rows beyond image height (8x8 mode only has 50*8=400 rows)
         if (row * GLYPH_H >= IMG_H) break;
         for (int col = 0; col < 80; col++) {
             int idx = (row * 80 + col) * 2;
@@ -4685,16 +6346,59 @@ static bool writeScreenshotBMP(const uint8_t vram[8000],
 
             for (int gy = 0; gy < GLYPH_H; gy++) {
                 uint8_t bits = glyph[gy];
-                int bmpY = IMG_H - 1 - (row * GLYPH_H + gy);
+                int pixY = row * GLYPH_H + gy;
                 int baseX = col * 8;
                 for (int gx = 0; gx < 8; gx++) {
                     const uint8_t* color = (bits >> (7 - gx)) & 1 ? fg : bg;
-                    int offset = 54 + bmpY * rowStride + (baseX + gx) * 3;
-                    bmp[offset]     = color[2]; // B
-                    bmp[offset + 1] = color[1]; // G
-                    bmp[offset + 2] = color[0]; // R
+                    int off = (pixY * IMG_W + baseX + gx) * 3;
+                    rgb[off]     = color[0]; // R
+                    rgb[off + 1] = color[1]; // G
+                    rgb[off + 2] = color[2]; // B
                 }
             }
+        }
+    }
+
+    string ext = getExtLower(filename);
+
+    if (ext == ".png") {
+        return stbi_write_png(filename.c_str(), IMG_W, IMG_H, 3,
+                              rgb.data(), IMG_W * 3) != 0;
+    }
+    if (ext == ".jpg" || ext == ".jpeg") {
+        return stbi_write_jpg(filename.c_str(), IMG_W, IMG_H, 3,
+                              rgb.data(), 90) != 0;
+    }
+
+    // Default: BMP (bottom-up BGR format)
+    const int rowStride = IMG_W * 3;
+    const int pixelDataSize = rowStride * IMG_H;
+    const int fileSize = 54 + pixelDataSize;
+    vector<uint8_t> bmp(fileSize);
+
+    // BMP file header (14 bytes)
+    bmp[0] = 'B'; bmp[1] = 'M';
+    bmp[2] = fileSize & 0xFF; bmp[3] = (fileSize >> 8) & 0xFF;
+    bmp[4] = (fileSize >> 16) & 0xFF; bmp[5] = (fileSize >> 24) & 0xFF;
+    bmp[10] = 54;
+
+    // DIB header (40 bytes)
+    bmp[14] = 40;
+    bmp[18] = IMG_W & 0xFF; bmp[19] = (IMG_W >> 8) & 0xFF;
+    bmp[22] = IMG_H & 0xFF; bmp[23] = (IMG_H >> 8) & 0xFF;
+    bmp[26] = 1;   // color planes
+    bmp[28] = 24;  // bits per pixel
+
+    // Convert top-down RGB to bottom-up BGR
+    for (int y = 0; y < IMG_H; y++) {
+        int srcRow = y;
+        int dstRow = IMG_H - 1 - y;
+        for (int x = 0; x < IMG_W; x++) {
+            int si = (srcRow * IMG_W + x) * 3;
+            int di = 54 + dstRow * rowStride + x * 3;
+            bmp[di]     = rgb[si + 2]; // B
+            bmp[di + 1] = rgb[si + 1]; // G
+            bmp[di + 2] = rgb[si];     // R
         }
     }
 
@@ -5068,6 +6772,7 @@ static bool isMacroReservedWord(const string& upper) {
         "ORG", "DB", "DW", "EQU", "PROC", "ENDP", "SEGMENT", "ENDS",
         "ASSUME", "END", "INCLUDE",
         "MACRO", "ENDM", "LOCAL", "REPT", "IRP",
+        "STRUC", "STRUCT",
         // Size specifiers
         "BYTE", "WORD", "PTR", "OFFSET", "SHORT", "NEAR", "FAR",
         "DUP",
@@ -5748,7 +7453,7 @@ int main(int argc, char* argv[]) {
             emuConfig.maxCycles = stoi(argv[i]);
         } else if (arg == "--input" && i + 1 < argc) {
             ++i;
-            emuConfig.stdinInput = argv[i];
+            emuConfig.stdinInput = unescapeInput(argv[i]);
         } else if (arg == "--mem-dump" && i + 1 < argc) {
             ++i;
             string mdarg = argv[i];
@@ -5778,6 +7483,12 @@ int main(int argc, char* argv[]) {
                 cerr << "Invalid --viewport format. Use: col,row,width,height" << endl;
                 return 1;
             }
+        } else if (arg == "--vram-fill") {
+            emuConfig.vramFill = true;
+            if (i + 1 < argc && string(argv[i + 1]).substr(0, 2) != "--") {
+                ++i;
+                emuConfig.vramFillText = argv[i];
+            }
         } else if (arg == "--attrs") {
             emuConfig.vpAttrs = true;
         } else if (arg == "--screenshot" && i + 1 < argc) {
@@ -5795,6 +7506,44 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--output-file" && i + 1 < argc) {
             ++i;
             emuConfig.outputFile = argv[i];
+        } else if (arg == "--mouse" && i + 1 < argc) {
+            ++i;
+            int mx = 0, my = 0, mb = 0;
+            int parsed = sscanf(argv[i], "%d,%d,%d", &mx, &my, &mb);
+            if (parsed >= 2) {
+                emuConfig.mouseEnabled = true;
+                emuConfig.mouseX = mx;
+                emuConfig.mouseY = my;
+                emuConfig.mouseButtons = (uint16_t)mb;
+            } else {
+                cerr << "Invalid --mouse format. Use: x,y[,buttons]" << endl;
+                return 1;
+            }
+        } else if (arg == "--events" && i + 1 < argc) {
+            ++i;
+            string evJson;
+            if (argv[i][0] == '@') {
+                string path = string(argv[i] + 1);
+                ifstream ef(path);
+                if (!ef) { cerr << "Cannot open events file: " << path << endl; return 1; }
+                evJson.assign(istreambuf_iterator<char>(ef), istreambuf_iterator<char>());
+            } else {
+                evJson = argv[i];
+            }
+            string err;
+            emuConfig.events = parseEvents(evJson, err);
+            if (!err.empty()) { cerr << "Events parse error: " << err << endl; return 1; }
+            for (const auto& ev : emuConfig.events) {
+                if (ev.hasMouse) { emuConfig.mouseEnabled = true; break; }
+            }
+        } else if (arg == "--dos-root" && i + 1 < argc) {
+            ++i;
+            emuConfig.dosRoot = argv[i];
+            namespace fs = std::filesystem;
+            if (!fs::is_directory(emuConfig.dosRoot)) {
+                cerr << "Error: --dos-root path is not a directory: " << emuConfig.dosRoot << endl;
+                return 1;
+            }
         } else {
             filename = arg;
         }
@@ -5874,20 +7623,42 @@ int main(int argc, char* argv[]) {
 
         AssemblerContext ctx;
         for (const auto& w : savedMacroWarnings) ctx.agentState.diagnostics.push_back(w);
-        // Pass 1
-        ctx.isPass1 = true; ctx.currentAddress = 0;
-        for (int i = 0; i < (int)lines.size(); ++i) {
-            vector<Token> tokens = tokenize(lines[i], i+1);
-            assembleLine(ctx, tokens, i+1, lines[i]);
+        // Pass 1 (iterative: re-run if Jcc promotions change label addresses)
+        // Iteration 0: populate symbol table (no promotion detection)
+        // Iteration 1+: detect out-of-range Jcc and mark for promotion; repeat until stable
+        for (int pass1Iter = 0; pass1Iter < 20; ++pass1Iter) {
+            size_t prevPromotions = ctx.promotedJumps.size();
+            ctx.isPass1 = true; ctx.currentAddress = 0;
+            // Don't clear symbolTable — forward refs need previous iteration's values
+            ctx.currentProcedureName = "";
+            ctx.currentStructName = "";
+            ctx.agentState.diagnostics.clear();
+            for (const auto& w : savedMacroWarnings) ctx.agentState.diagnostics.push_back(w);
+            ctx.globalError = false;
+            for (int i = 0; i < (int)lines.size(); ++i) {
+                vector<Token> tokens = tokenize(lines[i], i+1);
+                assembleLine(ctx, tokens, i+1, lines[i]);
+            }
+            if (!ctx.detectPromotions) {
+                // First iteration done — enable detection and always run at least one more
+                ctx.detectPromotions = true;
+            } else if (ctx.promotedJumps.size() == prevPromotions) {
+                break; // stable — no new promotions
+            }
         }
         // Pass 2
         ctx.agentState.diagnostics.clear();
         for (const auto& w : savedMacroWarnings) ctx.agentState.diagnostics.push_back(w);
         ctx.globalError = false;
         ctx.isPass1 = false; ctx.currentAddress = 0; ctx.machineCode.clear();
+        ctx.currentStructName = "";
         for (int i = 0; i < (int)lines.size(); ++i) {
             vector<Token> tokens = tokenize(lines[i], i+1);
             assembleLine(ctx, tokens, i+1, lines[i]);
+        }
+        if (!ctx.currentStructName.empty()) {
+            logError(ctx, 0, "Unclosed STRUC '" + ctx.currentStructName + "'",
+                "Every STRUC must have a matching ENDS.");
         }
 
         if (ctx.globalError) {
@@ -5953,12 +7724,29 @@ int main(int argc, char* argv[]) {
     // Forward macro warnings into assembler diagnostics
     for (const auto& w : expandErrors) ctx.agentState.diagnostics.push_back(w);
 
-    // Pass 1
-    ctx.isPass1 = true;
-    ctx.currentAddress = 0;
-    for (int i = 0; i < (int)lines.size(); ++i) {
-        vector<Token> tokens = tokenize(lines[i], i+1);
-        assembleLine(ctx, tokens, i+1, lines[i]);
+    // Pass 1 (iterative: re-run if Jcc promotions change label addresses)
+    // Iteration 0: populate symbol table (no promotion detection)
+    // Iteration 1+: detect out-of-range Jcc and mark for promotion; repeat until stable
+    for (int pass1Iter = 0; pass1Iter < 20; ++pass1Iter) {
+        size_t prevPromotions = ctx.promotedJumps.size();
+        ctx.isPass1 = true;
+        ctx.currentAddress = 0;
+        // Don't clear symbolTable — forward refs need previous iteration's values
+        ctx.currentProcedureName = "";
+        ctx.currentStructName = "";
+        ctx.agentState.diagnostics.clear();
+        for (const auto& w : expandErrors) ctx.agentState.diagnostics.push_back(w);
+        ctx.globalError = false;
+        for (int i = 0; i < (int)lines.size(); ++i) {
+            vector<Token> tokens = tokenize(lines[i], i+1);
+            assembleLine(ctx, tokens, i+1, lines[i]);
+        }
+        if (!ctx.detectPromotions) {
+            // First iteration done — enable detection and always run at least one more
+            ctx.detectPromotions = true;
+        } else if (ctx.promotedJumps.size() == prevPromotions) {
+            break; // stable — no new promotions
+        }
     }
 
     // Pass 2
@@ -5969,9 +7757,14 @@ int main(int argc, char* argv[]) {
     ctx.isPass1 = false;
     ctx.currentAddress = 0;
     ctx.machineCode.clear();
+    ctx.currentStructName = "";
     for (int i = 0; i < (int)lines.size(); ++i) {
         vector<Token> tokens = tokenize(lines[i], i+1);
         assembleLine(ctx, tokens, i+1, lines[i]);
+    }
+    if (!ctx.currentStructName.empty()) {
+        logError(ctx, 0, "Unclosed STRUC '" + ctx.currentStructName + "'",
+            "Every STRUC must have a matching ENDS.");
     }
 
     if (ctx.globalError) {
