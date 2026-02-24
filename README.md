@@ -291,7 +291,7 @@ cl /std:c++17 /O2 /Fe:agent86.exe main.cpp
 g++ -std=c++17 -O2 -o agent86.exe main.cpp
 ```
 
-Pre-built binaries for Linux, macOS, and Windows are available in [Releases](../../releases).
+Pre-built binaries for Windows are available in [Releases](../../releases).
 
 ## Contributing
 
