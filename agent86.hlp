@@ -1,0 +1,1405 @@
+@@TOPIC overview
+@@GROUP general
+@@BRIEF Identity, architecture, and quick start guide.
+@@RELATED flags, examples, --agent, --run-source
+
+agent86 is a 16-bit x86 real-mode assembler and emulator that produces and executes
+flat .COM binaries. It is a two-pass assembler written in C++ with a built-in 8086 CPU
+emulator, both with structured JSON output designed for agentic AI consumption.
+
+Target architecture: Intel 8086/8088 (with optional 80186 extensions)
+Output format:       Flat binary (.COM), loaded at offset 0100h
+Max address space:   65,535 bytes (one 64KB segment)
+Assembly pipeline:   expandIncludes() -> expandMacros() -> two-pass assembly
+
+Windows note: Run agent86 directly -- do NOT wrap in cmd.exe /c, as the cmd startup
+banner contaminates JSON output.
+
+PowerShell 5.x encoding trap: The > redirect in PS 5.x re-encodes output as UTF-16LE,
+breaking JSON parsers. Use --output-file result.json instead, or upgrade to PS 7+.
+
+@@EXAMPLES
+agent86 --agent hello.asm
+agent86 --run-source hello.asm
+agent86 --run hello.com
+agent86 --disassemble output.com
+agent86 --explain MOV
+agent86 --dump-isa
+agent86 --help [topic]
+@@END
+
+@@TOPIC flags
+@@GROUP general
+@@BRIEF All CLI flags at a glance.
+@@RELATED overview, examples
+
+Assembler flags:
+  --agent               Primary assembly mode. JSON report to stdout.
+  --disassemble         Disassemble .COM binary to structured JSON.
+  --explain <MNEMONIC>  Query ISA knowledge base for one instruction.
+  --dump-isa            Dump entire supported instruction set as JSON.
+  (no flags)            Human-readable mode. Not recommended for agents.
+
+Emulator flags:
+  --run <file.com>      Run a .COM binary in the emulator.
+  --run-source <f.asm>  Assemble and run in one step.
+  --breakpoints <a,b>   Set breakpoints at hex addresses (comma-separated).
+  --watch-regs <r,r>    Watch registers for changes. Emits snapshots.
+  --max-cycles <N>      Maximum CPU cycles before forced halt. Default: 1000000.
+  --input <string>      Stdin input for INT 21h/01h,06h. Escapes: \xHH \0 \n \r \t \\ \S
+  --args <string>       Command-line tail written to PSP at offset 80h.
+  --mem-dump <addr,len> Memory dump in breakpoint snapshots. Addr=hex, len=decimal.
+  --output-file <path>  Write JSON to file instead of stdout.
+
+Screen capture flags:
+  --screen              Capture full 80x50 screen from VRAM.
+  --viewport <c,r,w,h>  Capture a rectangular region of the screen.
+  --attrs               Include attribute bytes in screen output.
+  --screenshot <f.bmp>  Render VRAM as a 24-bit BMP image file.
+  --font 8x8|8x16      Font size for screenshot. Default: 8x16.
+  --vram-fill [text]    Pre-fill VRAM before program runs.
+
+Interaction flags:
+  --mouse <x,y[,btn]>   Configure mouse state for INT 33h.
+  --events <JSON|@file>  Script timeline of user interactions.
+  --dos-root <dir>       Mount host directory as DOS filesystem root (C:\).
+
+Help:
+  --help                List all help topics.
+  --help <topic>        Show detailed help for a specific topic.
+
+@@END
+
+@@TOPIC examples
+@@GROUP general
+@@BRIEF Common usage patterns and command examples.
+@@RELATED flags, overview, --agent, --run-source
+
+A collection of common command-line patterns for agent86.
+
+@@EXAMPLES
+agent86 --agent myprogram.asm
+agent86 --run-source myprogram.asm
+agent86 --run-source prog.asm --breakpoints 0120,0135 --watch-regs AX,DX
+agent86 --run-source prog.asm --input "Hello"
+agent86 --run output.com --breakpoints 0100 --mem-dump 0200,64
+agent86 --explain IMUL
+agent86 --dump-isa
+agent86 --disassemble output.com
+agent86 --run-source life.asm --screen
+agent86 --run-source life.asm --viewport 0,0,40,25 --attrs
+agent86 --run-source life.asm --screenshot screen.bmp --font 8x8
+agent86 --run-source game.asm --vram-fill "ABCD" --screen
+agent86 --run-source app.asm --events '[{"on":"poll:3","mouse":[320,100,1]},{"on":"read:1","keys":"Y"}]'
+agent86 --run-source app.asm --events @events.json
+agent86 --run-source filetest.asm --dos-root ./testdir
+agent86 --run-source life.asm --screen --output-file result.json
+agent86 --run-source prog.asm --args "param1 param2"
+@@END
+
+@@TOPIC --agent
+@@GROUP assembly
+@@BRIEF Primary assembly mode. Structured JSON report to stdout.
+@@RELATED --run-source, --disassemble, json-agent, errors, warnings
+
+Assemble a source file and emit structured JSON with diagnostics, listing, and symbols.
+
+Output JSON fields:
+  success       true/false -- whether a binary was produced
+  diagnostics[] errors/warnings with level, line, msg, and actionable hint
+  symbols{}     complete symbol table (name -> val, type, line, file)
+  listing[]     per-instruction details (addr, bytes, decoded, src, size)
+  includes[]    list of all source files involved
+
+Always read diagnostics[].hint first -- every diagnostic includes an actionable fix.
+Verify listing[].decoded matches your intent to detect misparsed instructions.
+
+@@EXAMPLES
+agent86 --agent source.asm
+@@END
+
+@@TOPIC --run
+@@GROUP emulation
+@@BRIEF Run a pre-compiled .COM binary in the emulator.
+@@RELATED --run-source, json-run, debugging, screen-capture
+
+Run a .COM binary and emit emulation results as JSON.
+
+The JSON output is the emulation section as a top-level object (same fields as
+--run-source emulation, plus finalState.sregs and finalState.flagBits).
+
+Combine with --breakpoints, --watch-regs, --screen, --viewport, --attrs,
+--screenshot, --mouse, --events, --dos-root, --input, --args, --mem-dump.
+
+@@EXAMPLES
+agent86 --run program.com
+agent86 --run program.com --breakpoints 0110,0120
+agent86 --run program.com --screen --attrs
+agent86 --run program.com --input "Hello\n"
+@@END
+
+@@TOPIC --run-source
+@@GROUP emulation
+@@BRIEF Assemble and run in one step. Combined JSON output.
+@@RELATED --agent, --run, json-run, debugging
+
+Assemble a source file and immediately run the binary in the emulator.
+
+Output JSON contains two top-level sections:
+  assembly.success       whether assembly succeeded
+  assembly.size          binary size in bytes
+  assembly.diagnostics[] assembly errors/warnings
+  emulation.*            all emulation fields (see json-run topic)
+
+If assembly fails, the emulation section has success:false with no meaningful state.
+
+Workflow:
+  1. Write .asm source
+  2. Run: agent86 --run-source source.asm
+  3. If assembly.success == false: read diagnostics, fix, retry
+  4. If assembly.success == true: check emulation.output, emulation.haltReason
+
+@@EXAMPLES
+agent86 --run-source source.asm
+agent86 --run-source source.asm --screen
+agent86 --run-source source.asm --breakpoints 0110 --watch-regs AX
+@@END
+
+@@TOPIC --disassemble
+@@GROUP assembly
+@@BRIEF Disassemble a .COM binary to structured JSON.
+@@RELATED --agent, json-disassemble
+
+Read a flat .COM binary and emit a JSON disassembly. Primary round-trip verification
+tool: assemble with --agent, then disassemble to confirm bytes decode correctly.
+
+Output JSON fields:
+  file             input filename
+  fileSize         total binary size in bytes
+  instructions[]   decoded instructions (addr, bytes, hex, asm, size)
+  dataRegions[]    bytes that could not be decoded as instructions
+
+The disassembler uses linear sweep (sequential from offset 0, not control-flow).
+Immediates displayed as uppercase hex with 0x prefix. Jump targets shown as absolute
+addresses. String data (DB) appears in dataRegions.
+
+@@EXAMPLES
+agent86 --disassemble output.com
+agent86 --agent source.asm && agent86 --disassemble source.com
+@@END
+
+@@TOPIC --explain
+@@GROUP assembly
+@@BRIEF Query ISA knowledge base for one instruction's valid forms.
+@@RELATED --dump-isa, instructions
+
+Query the ISA database for all valid operand forms of a given mnemonic.
+
+Output JSON:
+  { "mnemonic":"MOV", "found":true, "forms":[
+    {"op1":"REG","op2":"REG","notes":""},
+    {"op1":"REG","op2":"IMM","notes":""},
+    ...
+  ]}
+
+Operand type codes:
+  REG     any general-purpose register (8 or 16 bit)
+  REG8    8-bit only (AL,CL,DL,BL,AH,CH,DH,BH)
+  REG16   16-bit only (AX,CX,DX,BX,SP,BP,SI,DI)
+  MEM     memory operand ([BX], [BX+SI+4], etc.)
+  IMM     immediate value, label, or expression
+  LABEL   same as IMM, indicates relative addressing
+  SREG    segment register (ES,CS,SS,DS)
+  AL/AX   accumulator specifically
+  CL      CL register specifically
+  DX      DX register specifically
+  1       literal constant 1
+  NONE    no operand in this position
+
+@@EXAMPLES
+agent86 --explain MOV
+agent86 --explain IMUL
+agent86 --explain PUSH
+@@END
+
+@@TOPIC --dump-isa
+@@GROUP assembly
+@@BRIEF Dump the entire supported instruction set as JSON.
+@@RELATED --explain, instructions
+
+List all supported mnemonics with descriptions.
+
+Output: JSON array of objects with mnemonic and desc fields.
+
+@@EXAMPLES
+agent86 --dump-isa
+@@END
+
+@@TOPIC --breakpoints
+@@GROUP debugging
+@@BRIEF Set breakpoints at hex addresses for state capture.
+@@RELATED --watch-regs, --mem-dump, debugging
+
+Set breakpoints at specific addresses. When execution reaches a breakpoint, the
+emulator captures a full CPU state snapshot.
+
+Each snapshot contains:
+  addr       IP where breakpoint fired (hex)
+  cycle      instruction count when hit
+  reason     e.g. "Breakpoint at 0x0110"
+  nextInst   disassembly of instruction about to execute
+  registers  all 8 registers as hex
+  flags      flags register as hex
+  cursor     VRAM cursor position {row, col}
+  stack      top 8 words from stack
+  memDump    hex string of memory region (if --mem-dump configured)
+  screen[]   screen text (if --screen/--viewport used)
+  hitCount   times this address has been hit
+
+Limits: 10 full snapshots per address, 100 total. After 10 hits at one address,
+only hitCount increments on the last snapshot.
+
+@@EXAMPLES
+agent86 --run-source prog.asm --breakpoints 0110,0120
+agent86 --run prog.com --breakpoints 0100,0150 --mem-dump 0200,32
+agent86 --run-source life.asm --breakpoints 0150 --screen
+@@END
+
+@@TOPIC --watch-regs
+@@GROUP debugging
+@@BRIEF Watch registers for changes. Emits snapshots on change.
+@@RELATED --breakpoints, --mem-dump, debugging
+
+When a watched register changes value, a snapshot is emitted.
+
+Valid register names: AX, CX, DX, BX, SP, BP, SI, DI (case-insensitive).
+
+Snapshot reason format: "AX changed: 0x0005 -> 0x0006"
+
+Combine with --breakpoints for both positional and data-flow debugging.
+
+@@EXAMPLES
+agent86 --run-source prog.asm --watch-regs AX,DX,CX
+agent86 --run-source prog.asm --breakpoints 0110 --watch-regs AX,BX
+@@END
+
+@@TOPIC --max-cycles
+@@GROUP emulation
+@@BRIEF Maximum CPU cycles before forced halt. Default: 1000000.
+@@RELATED --run, --run-source
+
+Set the maximum number of instructions the emulator will execute before halting.
+
+Default is 1,000,000 cycles. When hit, haltReason = "Cycle limit reached (N)".
+Use cyclesExecuted in the output to detect infinite loops (will equal --max-cycles).
+
+@@EXAMPLES
+agent86 --run-source prog.asm --max-cycles 5000
+agent86 --run prog.com --max-cycles 500000
+@@END
+
+@@TOPIC --mem-dump
+@@GROUP debugging
+@@BRIEF Include memory dump in breakpoint snapshots.
+@@RELATED --breakpoints, --watch-regs, debugging
+
+When combined with breakpoints, each snapshot includes a hex dump of a memory region.
+
+Format: --mem-dump <hex_addr>,<decimal_length>
+The memDump field in each snapshot is a hex string of the specified region.
+
+@@EXAMPLES
+agent86 --run-source prog.asm --breakpoints 0110 --mem-dump 0200,32
+agent86 --run prog.com --breakpoints 0100 --mem-dump 0200,64
+@@END
+
+@@TOPIC --input
+@@GROUP interaction
+@@BRIEF Provide stdin input for the program.
+@@RELATED --args, --events, interaction
+
+Provide text input consumed by INT 21h/01h (read with echo) and INT 21h/06h (direct
+console I/O with DL=FFh).
+
+Supported escape sequences:
+  \xHH   hex byte
+  \0     null byte
+  \n     newline (0Ah)
+  \r     carriage return (0Dh)
+  \t     tab (09h)
+  \\     literal backslash
+  \S     shift-held prefix (sets Left Shift flag for the next byte)
+
+When input is exhausted, INT 21h/01h returns 0Dh (Enter).
+
+Shift prefix:
+  \SA          delivers 'A' with Left Shift held
+  \S\x00\S\x4B  delivers extended key pair 00h,4Bh with shift held
+
+@@EXAMPLES
+agent86 --run-source prog.asm --input "Hello\n"
+agent86 --run-source prog.asm --input "\x00\x4B"
+agent86 --run-source arrows.asm --input "\S\x00\S\x4B"
+@@END
+
+@@TOPIC --args
+@@GROUP interaction
+@@BRIEF Command-line arguments written to PSP command tail.
+@@RELATED --input, --run-source
+
+Provide a command-line tail string written to the PSP at offset 80h (length byte)
+and 81h+ (content with leading space, terminated by CR), following DOS convention.
+
+Maximum 126 characters. The program reads PSP:80h for length and PSP:81h for content.
+
+@@EXAMPLES
+agent86 --run-source prog.asm --args "param1 param2"
+@@END
+
+@@TOPIC --output-file
+@@GROUP general
+@@BRIEF Write JSON output to a file instead of stdout.
+@@RELATED flags
+
+Write all JSON output to a file, bypassing shell encoding issues.
+
+This avoids PowerShell 5.x UTF-16LE re-encoding and BOM insertion that breaks JSON
+parsers. Recommended whenever capturing output on Windows.
+
+@@EXAMPLES
+agent86 --run-source prog.asm --screen --output-file result.json
+agent86 --run-source life.asm --screen --attrs --output-file frames.json
+@@END
+
+@@TOPIC --screen
+@@GROUP screen-capture
+@@BRIEF Capture full 80x50 screen from VRAM into JSON output.
+@@RELATED --viewport, --attrs, --screenshot, --font, --vram-fill, screen-capture
+
+Capture the full 80x50 CGA text-mode VRAM screen.
+
+Adds screen[] to output: array of 50 strings, each 80 characters wide.
+Non-printable bytes replaced with '.' for clean JSON.
+
+Also included in breakpoint snapshots when used with --breakpoints.
+
+@@EXAMPLES
+agent86 --run-source life.asm --screen
+agent86 --run-source life.asm --screen --attrs
+agent86 --run-source life.asm --screen --breakpoints 0150
+@@END
+
+@@TOPIC --viewport
+@@GROUP screen-capture
+@@BRIEF Capture a rectangular region of the screen.
+@@RELATED --screen, --attrs, --screenshot, screen-capture
+
+Capture a sub-region of the 80x50 VRAM screen.
+
+Format: --viewport <col>,<row>,<width>,<height>
+
+Adds screen[] to output with rows of the specified width.
+
+@@EXAMPLES
+agent86 --run-source life.asm --viewport 0,0,40,25
+agent86 --run-source life.asm --viewport 10,5,20,10 --attrs
+agent86 --run-source life.asm --viewport 0,0,40,25 --breakpoints 0150
+@@END
+
+@@TOPIC --attrs
+@@GROUP screen-capture
+@@BRIEF Include CGA attribute bytes in screen output.
+@@RELATED --screen, --viewport, attributes, screen-capture
+
+Include attribute data alongside screen text.
+
+Adds screenAttrs[] parallel to screen[]. Each string has two hex digits per cell
+representing the CGA attribute byte (e.g. "07" = light grey on black, "1F" = white
+on blue).
+
+@@EXAMPLES
+agent86 --run-source colors.asm --screen --attrs
+agent86 --run-source vram_hi.asm --viewport 0,0,10,1 --attrs
+@@END
+
+@@TOPIC --screenshot
+@@GROUP screen-capture
+@@BRIEF Render VRAM as a 24-bit BMP image file.
+@@RELATED --font, --screen, screen-capture
+
+Render the VRAM contents as a BMP image using CP437 fonts with CGA 16-color palette.
+
+Output resolution depends on --font:
+  8x16 (default): 640x800 pixels
+  8x8:            640x400 pixels
+
+The screenshot field in JSON contains the output file path on success.
+
+@@EXAMPLES
+agent86 --run-source life.asm --screenshot screen.bmp
+agent86 --run-source life.asm --screenshot screen.bmp --font 8x8
+@@END
+
+@@TOPIC --font
+@@GROUP screen-capture
+@@BRIEF Select font size for BMP screenshot rendering.
+@@RELATED --screenshot, screen-capture
+
+Choose between 8x8 and 8x16 pixel fonts for --screenshot rendering.
+
+  8x16 (default)  640x800 pixels, taller characters
+  8x8             640x400 pixels, more compact
+
+@@EXAMPLES
+agent86 --run-source life.asm --screenshot screen.bmp --font 8x8
+agent86 --run-source life.asm --screenshot screen.bmp --font 8x16
+@@END
+
+@@TOPIC --vram-fill
+@@GROUP screen-capture
+@@BRIEF Pre-fill VRAM with known content before program runs.
+@@RELATED --screen, --viewport, screen-capture
+
+Pre-fill all 4000 VRAM character cells with a known pattern before the program runs.
+Useful for identifying which cells a program actually writes to.
+
+With text argument: tiles the string across all cells. Attribute bytes stay at 07h.
+Without argument: fills with random printable characters.
+
+Any cell still showing the fill pattern was never written by the program.
+
+@@EXAMPLES
+agent86 --run-source game.asm --vram-fill "." --screen
+agent86 --run-source game.asm --vram-fill "ABCD" --screen
+agent86 --run-source game.asm --vram-fill --screen
+@@END
+
+@@TOPIC --mouse
+@@GROUP interaction
+@@BRIEF Configure initial mouse state for INT 33h emulation.
+@@RELATED --events, int33h, interaction
+
+Set the initial mouse position and button state. Presence enables the mouse driver.
+
+Format: --mouse <x>,<y>[,<buttons>]
+  x,y       pixel coordinates
+  buttons   bitmask: 1=left, 2=right, 4=middle (default: 0)
+
+When enabled, INT 33h/0000h returns AX=FFFFh (driver installed).
+Without --mouse or --events with mouse actions, INT 33h returns AX=0 (not installed).
+
+@@EXAMPLES
+agent86 --run-source menu.asm --mouse 320,100,1
+agent86 --run-source draw.asm --mouse 160,50,0
+@@END
+
+@@TOPIC --events
+@@GROUP interaction
+@@BRIEF Script a timeline of keyboard and mouse interactions.
+@@RELATED --mouse, --input, interaction
+
+Script coordinated keyboard/mouse interactions triggered by program behavior.
+
+Trigger types (each event fires once when counter reaches the value):
+  read:N     Nth INT 21h keyboard read (AH=01h or 06h/DL=FFh)
+  poll:N     Nth INT 33h/0003h mouse position poll
+  tick:N     After Nth CPU cycle
+  int21:N    Nth INT 21h call (any function)
+  int33:N    Nth INT 33h call (any function)
+
+Action types (combinable per event):
+  mouse      [x, y, buttons]   Set mouse state. Auto-enables driver.
+  keys       "string"          Inject bytes into keyboard buffer.
+  snapshot   true              Capture CPU/memory snapshot.
+
+Keys support escapes: \xHH \n \r \t \0 \\ \S (shift prefix)
+
+JSON output includes events object: total, fired, pending, log[].
+
+@@EXAMPLES
+agent86 --run-source app.asm --events '[{"on":"poll:3","mouse":[320,100,1]},{"on":"read:1","keys":"Y"}]'
+agent86 --run-source app.asm --events @events.json
+agent86 --run-source app.asm --events '[{"on":"poll:5","mouse":[320,100,1],"snapshot":true},{"on":"poll:10","mouse":[320,100,0]},{"on":"read:1","keys":"Y"}]'
+@@END
+
+@@TOPIC --dos-root
+@@GROUP file-io
+@@BRIEF Mount a host directory as DOS filesystem root for file I/O.
+@@RELATED file-io, int21h
+
+Mount a host directory as the DOS C:\ drive, enabling INT 21h file operations.
+
+Enables: create (3Ch), open (3Dh), close (3Eh), read (3Fh), write (40h),
+seek (42h), attributes (43h), chdir (3Bh), getcwd (47h), FindFirst (4Eh),
+FindNext (4Fh).
+
+Path sandboxing:
+  - Drive letters stripped: C:\FILE.TXT becomes FILE.TXT relative to root
+  - Backslashes normalized to forward slashes
+  - Relative paths use current directory (set by AH=3Bh)
+  - Directory traversal blocked: .. cannot escape the root
+  - Canonical path validation ensures containment
+
+Without --dos-root, all file/directory functions return CF=1, AX=2 (file not found).
+Console I/O and system functions work regardless.
+
+@@EXAMPLES
+agent86 --run-source fileapp.asm --dos-root ./testdir
+agent86 --run-source reader.asm --dos-root /path/to/files
+agent86 --run-source fileapp.asm --dos-root ./data --breakpoints 0120 --watch-regs AX,BX
+@@END
+
+@@TOPIC debugging
+@@GROUP debugging
+@@BRIEF Breakpoints, watchpoints, and memory dumps for debugging.
+@@RELATED --breakpoints, --watch-regs, --mem-dump, screen-capture
+
+Combined reference for all debugging features.
+
+Breakpoints: Set with --breakpoints <hex_addr,...>
+  Capture full CPU state snapshot when IP reaches the address.
+  10 full snapshots per address, 100 total.
+
+Watchpoints: Set with --watch-regs <reg,...>
+  Snapshot emitted when a watched register changes value.
+  Valid: AX, CX, DX, BX, SP, BP, SI, DI
+
+Memory dumps: Set with --mem-dump <hex_addr>,<decimal_len>
+  Each breakpoint snapshot includes hex dump of the specified region.
+
+Debugging workflow:
+  1. Find suspect address from --agent listing[].addr
+  2. Run with --breakpoints at that address
+  3. Inspect snapshots[].registers, .nextInst, .stack
+  4. Add --watch-regs to trace data flow
+  5. Add --mem-dump to inspect memory at each breakpoint
+  6. For VRAM programs, add --screen to capture display at each snapshot
+
+@@EXAMPLES
+agent86 --agent source.asm
+agent86 --run-source prog.asm --breakpoints 0110,0120 --watch-regs AX,DX --mem-dump 0200,32
+agent86 --run-source life.asm --viewport 0,0,40,25 --breakpoints 0150
+agent86 --run-source life.asm --screen --breakpoints 0150 --output-file frames.json
+@@END
+
+@@TOPIC screen-capture
+@@GROUP screen-capture
+@@BRIEF Screen, viewport, attrs, screenshot, font, and vram-fill together.
+@@RELATED --screen, --viewport, --attrs, --screenshot, --font, --vram-fill
+
+Combined reference for all screen capture features.
+
+The emulator provides an 8KB VRAM buffer (segment B800h, 80x50 CGA text mode).
+Each cell is 2 bytes: character + attribute. Programs write via ES:DI or INT 10h.
+
+Capture flags:
+  --screen              Full 80x50 capture -> screen[] in JSON
+  --viewport c,r,w,h    Sub-region capture -> screen[] in JSON
+  --attrs               Add screenAttrs[] parallel to screen[]
+  --screenshot f.bmp    Render to BMP image (CP437 + CGA 16 colors)
+  --font 8x8|8x16      Font size for BMP (default 8x16)
+  --vram-fill [text]    Pre-fill VRAM to detect which cells programs write
+
+screen[] is an array of strings, one per row. Non-printable bytes -> '.'
+screenAttrs[] has two hex digits per cell (e.g. "07" = light grey on black).
+
+Screen data is included in breakpoint snapshots too, enabling frame-by-frame
+inspection of VRAM programs (games, animations).
+
+@@EXAMPLES
+agent86 --run-source life.asm --screen
+agent86 --run-source life.asm --viewport 0,0,40,25 --attrs
+agent86 --run-source life.asm --screenshot screen.bmp --font 8x8
+agent86 --run-source game.asm --vram-fill "." --screen
+agent86 --run-source life.asm --viewport 0,0,40,25 --attrs --breakpoints 0150
+@@END
+
+@@TOPIC interaction
+@@GROUP interaction
+@@BRIEF Mouse, events, input, and args together.
+@@RELATED --mouse, --events, --input, --args
+
+Combined reference for all user interaction features.
+
+Keyboard input: --input <string>
+  Consumed by INT 21h/01h and 06h. Supports \xHH \0 \n \r \t \\ \S escapes.
+
+Command-line args: --args <string>
+  Written to PSP at 80h (length) and 81h+ (content with leading space + CR).
+
+Mouse state: --mouse <x>,<y>[,<buttons>]
+  Sets initial mouse position. Enables INT 33h driver.
+
+Event scripting: --events <JSON|@file>
+  Triggers: read:N, poll:N, tick:N, int21:N, int33:N
+  Actions: mouse, keys, snapshot
+
+Composability: --events works with --input and --mouse. Event-injected keys insert
+at the current read position. Events can override mouse state set by --mouse.
+
+Workflow for interactive programs:
+  1. First run with no events to see what the program expects
+  2. Add read:N triggers for keyboard prompts
+  3. Add poll:N triggers for mouse interactions
+  4. Attach snapshot:true to key moments
+  5. Check events.pending to see if all events fired
+
+@@EXAMPLES
+agent86 --run-source prog.asm --input "Hello\n"
+agent86 --run-source prog.asm --args "param1 param2"
+agent86 --run-source menu.asm --mouse 320,100,1
+agent86 --run-source app.asm --events '[{"on":"poll:3","mouse":[320,100,1]},{"on":"read:1","keys":"Y"}]'
+agent86 --run-source app.asm --events @events.json
+@@END
+
+@@TOPIC file-io
+@@GROUP file-io
+@@BRIEF DOS file I/O, DTA layout, path sandboxing.
+@@RELATED --dos-root, int21h
+
+File handle I/O requires --dos-root to be set (except device handles 0-4).
+
+Device handles (always available):
+  0  STDIN   reads from --input buffer
+  1  STDOUT  writes to output/VRAM
+  2  STDERR  writes to output/VRAM
+  3  AUX     discarded
+  4  PRN     discarded
+
+File operations (require --dos-root):
+  AH=3Ch  Create/truncate file  DS:DX=path, CX=attrs -> AX=handle
+  AH=3Dh  Open file             DS:DX=path, AL=mode  -> AX=handle
+  AH=3Eh  Close file            BX=handle
+  AH=3Fh  Read file             BX=handle, CX=count, DS:DX=buf -> AX=read
+  AH=40h  Write file            BX=handle, CX=count, DS:DX=buf -> AX=written
+  AH=42h  Seek                  BX=handle, AL=origin, CX:DX=offset -> DX:AX=pos
+  AH=43h  Get/set attributes    AL=0:get, AL=1:set
+  AH=57h  Get file date/time    AL=0, BX=handle -> CX=time, DX=date
+
+Directory operations (require --dos-root):
+  AH=3Bh  Change directory      DS:DX=path
+  AH=47h  Get current directory  DS:SI=buffer, DL=drive
+  AH=4Eh  FindFirst             DS:DX=pattern, CX=attr mask -> writes DTA
+  AH=4Fh  FindNext              continues previous FindFirst -> writes DTA
+
+Error convention: CF=1 on failure, AX=error code.
+  1=invalid function, 2=file not found, 3=path not found,
+  5=access denied, 6=invalid handle, 18=no more files
+
+DTA layout (43 bytes, set with AH=1Ah, default at PSP:0080h):
+  00h  21 bytes  Reserved (search state)
+  15h  1 byte    File attribute (10h=directory, 20h=file)
+  16h  2 bytes   Packed time (hrs:5|min:6|sec/2:5)
+  18h  2 bytes   Packed date (yr-1980:7|mon:4|day:5)
+  1Ah  4 bytes   File size (DWORD, little-endian)
+  1Eh  13 bytes  Filename in 8.3 format, null-terminated
+
+FindFirst CX mask: 00h=files only, 10h=files+dirs, 02h=files+hidden, 16h=all
+
+Wildcard matching (DOS conventions, case-insensitive, 8.3 format):
+  *.*     all entries
+  *.TXT   .TXT extension only
+  DATA.*  DATA with any extension
+  FILE?   single-char wildcard
+
+@@EXAMPLES
+agent86 --run-source reader.asm --dos-root ./testdir
+agent86 --run-source writer.asm --dos-root ./testdir
+agent86 --run-source dirlist.asm --dos-root ./myfiles
+@@END
+
+@@TOPIC syntax
+@@GROUP reference
+@@BRIEF Registers, numeric literals, labels, memory operands, expressions.
+@@RELATED addressing, directives, instructions
+
+Registers:
+  8-bit:   AL, CL, DL, BL, AH, CH, DH, BH
+  16-bit:  AX, CX, DX, BX, SP, BP, SI, DI
+  Segment: ES, CS, SS, DS
+  All names are case-insensitive.
+
+Numeric literals:
+  Decimal:       100, 100d
+  Hex (suffix):  0FFh, 100h       MUST start with digit (0FFh not FFh)
+  Hex (prefix):  0xFF
+  Binary:        10110b, 0b10110
+  Octal:         177o, 177q
+
+Labels:
+  start:          global label (visible everywhere)
+  myproc: PROC
+  .loop:          local label (scoped to enclosing PROC, stored as MYPROC.LOOP)
+  ENDP
+
+Labels require colon syntax on their own line. Case-insensitive (stored uppercase).
+Local labels (. prefix) require enclosing PROC/ENDP block.
+
+Memory operands:
+  [100h]           direct address
+  [BX]             base register
+  [BX+4]           base + displacement
+  [BX+SI]          base + index
+  [BX+SI+10h]      base + index + displacement
+  [BP+DI]          BP-based (defaults to SS segment)
+
+Segment overrides:
+  MOV AX, ES:[BX]
+  MOV AX, [ES:BX]
+
+Size prefixes (required for memory-immediate operations):
+  MOV BYTE [BX], 5      8-bit store
+  MOV WORD [BX], 5      16-bit store
+  Without prefix, assembler defaults to WORD and emits a WARNING.
+
+Expressions:
+  Operators: + - * / (integer division), unary -, parentheses
+  Special: $ = current address counter
+
+Comments: ; begins a comment to end of line.
+
+@@EXAMPLES
+MOV CX, BUFSIZE * 2
+JMP $ + 5
+MOV AX, (BUFSIZE + 4) / 2
+@@END
+
+@@TOPIC directives
+@@GROUP reference
+@@BRIEF ORG, DB/DW/DD, RESB/RESW, EQU, PROC/ENDP, INCLUDE.
+@@RELATED syntax, macros, structs
+
+ORG <addr>       Set address counter. Use ORG 100h for .COM files.
+DB <vals>        Define bytes. Strings, numbers, expressions, comma-separated.
+DW <vals>        Define 16-bit words (little-endian).
+DD <vals>        Define 32-bit doublewords (little-endian).
+RESB <n>         Reserve n zero-initialized bytes.
+RESW <n>         Reserve n zero-initialized words (n*2 zero bytes).
+EQU              Define compile-time constant: BUFSIZE EQU 256
+PROC             Begin named procedure: myproc: PROC (enables local labels)
+ENDP             End current procedure scope.
+INCLUDE          Insert another source file: INCLUDE 'file.asm'
+
+INCLUDE details:
+  Syntax: INCLUDE 'file.asm', INCLUDE "file.asm", INCLUDE file.inc
+  Path resolution: relative to the including file's directory
+  Nesting: up to 16 levels deep; circular includes detected
+  Case-insensitive keyword
+
+Data directives go after a label defined on a separate line:
+  msg:
+      DB 'Hello', 0
+
+@@EXAMPLES
+ORG 100h
+DB 'Hello', 0Dh, 0Ah, '$'
+DW 1234h, label_addr
+RESB 64
+BUFSIZE EQU 256
+INCLUDE 'data.asm'
+@@END
+
+@@TOPIC macros
+@@GROUP reference
+@@BRIEF MACRO/ENDM, LOCAL, REPT, IRP, nesting, concatenation.
+@@RELATED directives, syntax
+
+Macros are expanded as a text-level preprocessor step after INCLUDE expansion but
+before two-pass assembly. Pipeline: expandIncludes() -> expandMacros() -> assembly.
+
+Named macros:
+  name MACRO [param1, param2, ...]
+  ... body ...
+  ENDM
+
+Substitution: case-insensitive, word-boundary only, strings/comments protected.
+Name appears before MACRO keyword. Invoke by using macro name as instruction.
+
+& concatenation (consumed during substitution):
+  name&num: joins parameter text with surrounding characters.
+
+LOCAL labels (unique ??XXXX names per expansion):
+  LOCAL must appear before instructions in macro body.
+
+REPT -- repeat N times (count must be numeric literal, not symbol):
+  REPT 5 / ... / ENDM
+
+IRP -- iterate over angle-bracket list:
+  IRP reg, <AX, BX, CX, DX> / ... / ENDM
+
+Nesting: macros can invoke other macros. REPT/IRP can appear inside macros.
+Expansion iterates up to 10,000 iterations. Self-recursive macros will hit limit.
+
+Restrictions:
+  - Macro names cannot shadow reserved words
+  - Redefining a macro emits warning
+  - Argument count mismatch emits warning (missing -> empty, extras ignored)
+  - REPT count must be literal, not symbol or expression
+
+@@EXAMPLES
+PrintChar MACRO ch / MOV DL, ch / MOV AH, 02h / INT 21h / ENDM
+MakeLabel MACRO name, num / name&num: / DB 0 / ENDM
+Skip MACRO / LOCAL done / JMP done / NOP / done: / ENDM
+REPT 5 / NOP / ENDM
+IRP reg, <AX, BX, CX, DX> / PUSH reg / ENDM
+@@END
+
+@@TOPIC structs
+@@GROUP reference
+@@BRIEF STRUC/ENDS definitions with field offsets and instance allocation.
+@@RELATED directives, syntax
+
+Define named data structures with automatic field offset calculation (MASM-compatible).
+
+Definition (no code emitted, creates offset constants):
+  name STRUC / fields / name ENDS
+
+Field types: DB (1 byte), DW (2 bytes), DD (4 bytes), RESB n, RESW n.
+
+Using offsets in expressions:
+  MOV AX, [BX + POINT.X]
+  ADD BX, POINT              ; advance pointer by struct size
+
+Instance allocation with angle-bracket overrides:
+  pt1 POINT <100, 200>       emits DW 100, DW 200
+  pt2 POINT <>                emits defaults
+  pt3 POINT <10>              partial: first field=10, rest=defaults
+
+Skipped fields use defaults: <10, , 30> overrides first and third, keeps second.
+
+@@EXAMPLES
+POINT STRUC / X DW 0 / Y DW 0 / POINT ENDS
+pt1 POINT <100, 200>
+MOV AX, [BX + POINT.X]
+@@END
+
+@@TOPIC instructions
+@@GROUP reference
+@@BRIEF Full instruction set by category.
+@@RELATED --explain, --dump-isa, addressing
+
+Data movement:
+  MOV   reg/mem/sreg combinations    XCHG  reg<->reg, reg<->mem
+  LEA   reg16<-mem                   PUSH  reg16, mem16, sreg
+  POP   reg16, mem16, sreg           PUSHA/POPA  all regs (80186+)
+  PUSHF/POPF  flags register         XLAT  AL=[BX+AL] table lookup
+  IN    AL/AX<-port                  OUT   port<-AL/AX
+
+Arithmetic:
+  ADD ADC SUB SBB  reg/mem/imm combinations
+  CMP    like SUB, flags only        INC DEC  reg/mem (preserves CF)
+  NEG    two's complement            MUL IMUL  unsigned/signed multiply
+  DIV IDIV  unsigned/signed divide   CBW  sign-extend AL->AX
+  CWD    sign-extend AX->DX:AX
+
+Logic:
+  AND OR XOR  reg/mem/imm            NOT  bitwise invert
+  TEST  like AND, flags only
+
+Shift/rotate:
+  SHL/SAL SHR SAR  shift left/right
+  ROL ROR RCL RCR  rotate
+  Forms: reg/mem,1  reg/mem,CL  reg/mem,imm (imm>1 = 80186+)
+
+Flags: CLC STC CMC CLD STD CLI STI LAHF SAHF
+Misc:  NOP XLAT/XLATB HLT
+
+Control flow:
+  JMP   near, indirect (reg16/mem16)
+  CALL  near, indirect (reg16/mem16)
+  RET   return from call
+  Jcc   all conditional jumps (auto-promoted beyond short range)
+  LOOP  dec CX, jump if CX!=0 (short range only, NOT auto-promoted)
+  LOOPE/LOOPZ  LOOPNE/LOOPNZ  JCXZ
+
+String: MOVSB/W CMPSB/W STOSB/W LODSB/W SCASB/W
+Prefix: REP/REPE/REPZ REPNE/REPNZ
+
+Interrupts: INT imm8
+
+@@EXAMPLES
+agent86 --explain MOV
+agent86 --explain IMUL
+agent86 --dump-isa
+@@END
+
+@@TOPIC addressing
+@@GROUP reference
+@@BRIEF 8086 addressing modes and segment overrides.
+@@RELATED syntax, instructions
+
+The 8086 supports these base/index register combinations in memory operands:
+
+  R/M  Registers    Default Segment
+   0   [BX+SI]      DS
+   1   [BX+DI]      DS
+   2   [BP+SI]      SS
+   3   [BP+DI]      SS
+   4   [SI]         DS
+   5   [DI]         DS
+   6   [BP]         SS (direct addr if no base)
+   7   [BX]         DS
+
+Each can have an optional displacement: [BX+SI+10h]
+Direct addressing: [100h] uses DS by default.
+
+Segment overrides:
+  MOV AX, ES:[BX]       ; prefix form
+  MOV AX, [ES:BX]       ; inside brackets
+
+Only BX, BP, SI, DI are valid in memory operands.
+AX, CX, DX, SP are NOT valid inside [] brackets.
+
+BP-based addressing defaults to SS; all others default to DS.
+
+@@EXAMPLES
+MOV AX, [BX+SI+10h]
+MOV AX, ES:[BX]
+MOV AX, [100h]
+MOV AX, [BP+DI]
+@@END
+
+@@TOPIC interrupts
+@@GROUP interrupts
+@@BRIEF Overview of all emulated interrupts.
+@@RELATED int10h, int16h, int20h, int21h, int33h
+
+The emulator handles these interrupts. All others are logged in skipped[].
+
+INT 10h  BIOS Video Services
+  Set/get cursor, scroll window, write characters, teletype output, video mode.
+  8KB VRAM at segment B800h (80x50 CGA text mode, char+attr per cell).
+
+INT 16h  BIOS Keyboard Services
+  AH=02h: get shift flags in AL (bit 0=RShift, 1=LShift, 2=Ctrl, 3=Alt).
+
+INT 20h  Program Terminate
+  Halts emulation with exitCode 0. Standard .COM termination.
+
+INT 21h  DOS Function Calls
+  28 functions: console I/O, system info, file handle I/O, directory operations.
+
+INT 33h  Mouse Services
+  Position, buttons, ranges, visibility. Enabled by --mouse or --events.
+
+@@EXAMPLES
+agent86 --help int10h
+agent86 --help int21h
+agent86 --help int33h
+@@END
+
+@@TOPIC int10h
+@@GROUP interrupts
+@@BRIEF BIOS video services (INT 10h).
+@@RELATED interrupts, attributes, screen-capture
+
+VRAM: 8KB at segment B800h, 80x50 text mode. Each cell = 2 bytes (char + attr).
+
+  AH=00h  Set video mode     AL=mode (only mode 3 meaningful). Clears screen.
+  AH=02h  Set cursor pos     DH=row, DL=col, BH=page (ignored)
+  AH=03h  Get cursor pos     Returns DH=row, DL=col, CX=shape
+  AH=06h  Scroll up          AL=lines (0=clear), BH=fill attr, CH,CL=top, DH,DL=bottom
+  AH=07h  Scroll down        Same params as 06h, scrolls downward
+  AH=08h  Read char/attr     Returns AL=char, AH=attr at cursor
+  AH=09h  Write char+attr    AL=char, BL=attr, CX=count. No cursor advance.
+  AH=0Ah  Write char only    AL=char, CX=count. Keeps existing attr. No advance.
+  AH=0Eh  Teletype output    AL=char. Writes and advances cursor. Handles CR/LF/BS.
+  AH=0Fh  Get video mode     Returns AL=3, AH=80, BH=0
+
+@@EXAMPLES
+MOV AX, 0600h / MOV BH, 1Fh / XOR CX, CX / MOV DH, 24 / MOV DL, 79 / INT 10h
+MOV AH, 02h / MOV DH, 5 / MOV DL, 10 / XOR BH, BH / INT 10h
+MOV AH, 0Eh / MOV AL, 'A' / INT 10h
+@@END
+
+@@TOPIC int16h
+@@GROUP interrupts
+@@BRIEF BIOS keyboard services (INT 16h).
+@@RELATED interrupts, --input, --events
+
+  AH=02h  Get shift flags    Returns AL = shift flags byte
+
+Shift flags byte (AL):
+  Bit 0: Right Shift held
+  Bit 1: Left Shift held
+  Bit 2: Ctrl held (not yet emulated)
+  Bit 3: Alt held (not yet emulated)
+  Bit 4-7: Lock states (not emulated)
+
+Shift state is driven by \S prefix in --input or event keys strings.
+  \SA          delivers 'A' with Left Shift (bit 1) set
+  \S\x00\S\x4B  extended key with shift held for both bytes
+  Unshifted keys clear the shift flags.
+
+@@EXAMPLES
+MOV AH, 02h / INT 16h / AND AL, 03h / JNZ shifted
+agent86 --run-source arrows.asm --input "\S\x00\S\x4B"
+@@END
+
+@@TOPIC int20h
+@@GROUP interrupts
+@@BRIEF Program termination (INT 20h).
+@@RELATED interrupts, int21h
+
+INT 20h halts emulation with exitCode 0. This is the standard .COM termination.
+
+A program that returns with an empty stack (RET when SP=FFFEh) will execute the
+INT 20h placed at address 0000h (PSP stub) by the emulator.
+
+Alternative: INT 21h/4Ch exits with a return code in AL.
+
+@@EXAMPLES
+INT 20h
+MOV AH, 4Ch / MOV AL, 0 / INT 21h
+@@END
+
+@@TOPIC int21h
+@@GROUP interrupts
+@@BRIEF DOS function calls (INT 21h) -- all subfunctions.
+@@RELATED interrupts, file-io, --dos-root, --input
+
+28 implemented functions in four categories.
+
+Console I/O:
+  AH=01h  Read char with echo    -> AL=char (0Dh if input exhausted)
+  AH=02h  Write character        DL=char -> output
+  AH=06h  Direct console I/O     DL=FFh: read (ZF=0+AL if avail, ZF=1 if not)
+                                  DL!=FFh: write DL to output
+  AH=09h  Write $-string         DS:DX=string, prints until '$'. Cap: 4096 bytes.
+
+System:
+  AH=0Eh  Select disk            DL=drive (0=A,2=C) -> AL=26
+  AH=19h  Get current disk       -> AL=drive (default 2=C:)
+  AH=1Ah  Set DTA                DS:DX=address
+  AH=25h  Set interrupt vector   stub, silently ignored
+  AH=2Ah  Get date               -> CX=year, DH=month, DL=day, AL=dow
+  AH=2Ch  Get time               -> CH=hr, CL=min, DH=sec, DL=csec
+  AH=2Fh  Get DTA                -> ES:BX=DTA address (default PSP:0080h)
+  AH=30h  Get DOS version        -> AL=5, AH=0 (DOS 5.0)
+  AH=35h  Get interrupt vector   stub -> ES:BX=0000:0000
+  AH=62h  Get PSP segment        -> BX=0
+
+File handle I/O (handles 5+ require --dos-root):
+  AH=3Ch  Create file            DS:DX=path, CX=attr -> AX=handle
+  AH=3Dh  Open file              DS:DX=path, AL=mode(0=r,1=w,2=rw) -> AX=handle
+  AH=3Eh  Close file             BX=handle
+  AH=3Fh  Read                   BX=handle, CX=count, DS:DX=buf -> AX=bytes
+  AH=40h  Write                  BX=handle, CX=count, DS:DX=buf -> AX=bytes
+  AH=42h  Seek                   BX=handle, AL=origin(0/1/2), CX:DX=offset -> DX:AX
+  AH=43h  Get/set attrs          AL=0:get->CX, AL=1:set(stub)
+  AH=44h/00 IOCTL get info       BX=handle -> DX=info word
+  AH=44h/09 IOCTL block remote   BL=drive -> DX=0(local) for C:
+  AH=57h  Get file date/time     AL=0, BX=handle -> CX=time, DX=date
+  AH=4Ch  Exit with code         AL=exit code
+
+Directory (require --dos-root):
+  AH=3Bh  Change directory       DS:DX=path
+  AH=47h  Get current directory  DS:SI=buf, DL=drive
+  AH=4Eh  FindFirst              DS:DX=pattern, CX=attr mask -> DTA
+  AH=4Fh  FindNext               -> DTA
+
+Error convention: CF=1 on failure, AX = error code.
+  1=invalid, 2=not found, 3=path not found, 5=denied, 6=bad handle, 18=no more
+
+@@EXAMPLES
+MOV AH, 09h / MOV DX, msg / INT 21h
+MOV AH, 01h / INT 21h
+MOV AH, 4Ch / MOV AL, 0 / INT 21h
+MOV AH, 3Dh / MOV AL, 0 / MOV DX, filename / INT 21h / JC error
+MOV AH, 4Eh / MOV CX, 0 / MOV DX, pattern / INT 21h / JC done
+@@END
+
+@@TOPIC int33h
+@@GROUP interrupts
+@@BRIEF Mouse services (INT 33h).
+@@RELATED --mouse, --events, interaction
+
+Enabled by --mouse or --events with mouse actions. Dispatches on full AX register.
+
+  AX=0000h  Reset/detect        -> AX=FFFFh (installed), BX=3 (buttons)
+  AX=0001h  Show cursor         sets visible flag
+  AX=0002h  Hide cursor         clears visible flag
+  AX=0003h  Get position/btns   -> BX=buttons, CX=x, DX=y
+  AX=0004h  Set position        CX=x, DX=y (clamped to range)
+  AX=0005h  Button press info   BX=btn -> BX=count, AX=btns, CX=x, DX=y
+  AX=0006h  Button release info same as 0005h for releases
+  AX=0007h  Set horiz range     CX=min, DX=max
+  AX=0008h  Set vert range      CX=min, DX=max
+  AX=000Bh  Get motion          -> CX=0, DX=0 (not tracked)
+  AX=000Ch  Set event handler   silently ignored
+
+Without --mouse/--events: AX=0000h returns AX=0 (not installed).
+
+@@EXAMPLES
+MOV AX, 3 / INT 33h
+agent86 --run-source mouse.asm --mouse 320,100,1
+agent86 --run-source app.asm --events '[{"on":"poll:3","mouse":[320,100,1]}]'
+@@END
+
+@@TOPIC json
+@@GROUP schemas
+@@BRIEF Overview of all JSON output formats.
+@@RELATED json-agent, json-run, json-disassemble
+
+All modes emit structured JSON to stdout (or --output-file).
+
+--agent output:
+  {success, diagnostics[], symbols{}, listing[], includes[]}
+
+--run-source output:
+  {assembly: {success, size, diagnostics[]},
+   emulation: {success, halted, haltReason, exitCode, cyclesExecuted,
+               fidelity, output, outputHex, finalState, skipped[],
+               screen[], screenAttrs[], screenshot, events, fileIO, diagnostics[]}}
+
+--run output:
+  Same as emulation section of --run-source, plus finalState.sregs and flagBits.
+  snapshots[] included when --breakpoints or --watch-regs used.
+
+--disassemble output:
+  {file, fileSize, instructions[], dataRegions[]}
+
+--explain output:
+  {mnemonic, found, forms[]}
+
+--dump-isa output:
+  [{mnemonic, desc}, ...]
+
+Error output (any mode):
+  {"error": "message"}
+
+@@EXAMPLES
+agent86 --help json-agent
+agent86 --help json-run
+agent86 --help json-disassemble
+@@END
+
+@@TOPIC json-agent
+@@GROUP schemas
+@@BRIEF --agent output schema: success, diagnostics, symbols, listing.
+@@RELATED --agent, json
+
+Schema for --agent JSON output:
+
+{
+  "success": true|false,
+  "diagnostics": [
+    {"level":"ERROR|WARNING|INFO", "line":N, "msg":"...", "hint":"...",
+     "file":"..." (with INCLUDE), "sourceLine":N (with INCLUDE)}
+  ],
+  "symbols": {
+    "NAME": {"val":N, "type":"LABEL|EQU", "line":N,
+             "file":"..." (with INCLUDE), "sourceLine":N}
+  },
+  "listing": [
+    {"addr":N, "line":N, "size":N, "decoded":"...", "src":"...",
+     "bytes":[...], "file":"..." (with INCLUDE), "sourceLine":N}
+  ],
+  "includes": ["file1.asm", ...]
+}
+
+Key fields:
+  success       true = binary produced, false = errors occurred
+  hint          always present, contains actionable fix for agents
+  decoded       how assembler interpreted instruction (compare vs intent)
+  bytes         raw machine code as decimal integers
+
+@@EXAMPLES
+agent86 --agent source.asm
+@@END
+
+@@TOPIC json-run
+@@GROUP schemas
+@@BRIEF --run / --run-source emulation output schema.
+@@RELATED --run, --run-source, json
+
+Emulation output fields (in --run-source under "emulation", in --run at top level):
+
+  success          true if emulator ran without internal errors
+  halted           true if program terminated
+  haltReason       "INT 20h program terminate", "INT 21h/4Ch exit (code=N)",
+                   "HLT instruction at 0xNNNN", "Cycle limit reached (N)",
+                   "Division by zero", "Division overflow"
+  exitCode         from INT 21h/4Ch AL, or 0 for INT 20h
+  cyclesExecuted   instruction count (= --max-cycles means possible infinite loop)
+  fidelity         0.0-1.0 ratio of emulated vs total instructions
+  output           text output (INT 21h/02h,06h,09h). Capped at 4096 bytes.
+  outputHex        same output as hex string for binary-safe inspection
+  finalState       {registers{AX..DI}, IP, flags, flagBits (--run), cursor{row,col},
+                    sregs (--run), mouse{x,y,buttons,visible} (when mouse enabled)}
+  skipped[]        [{instruction, reason}] for unhandled instructions
+  snapshots[]      breakpoint/watchpoint state captures
+  screen[]         VRAM text (with --screen/--viewport)
+  screenAttrs[]    attribute hex (with --attrs)
+  screenshot       BMP path (with --screenshot)
+  events           {total, fired, pending, log[]} (with --events)
+  fileIO           {filesOpened, filesClosed, bytesRead, bytesWritten,
+                    dirSearches, errors} (with --dos-root)
+  diagnostics[]    runtime diagnostics
+
+@@EXAMPLES
+agent86 --run-source source.asm
+agent86 --run program.com
+@@END
+
+@@TOPIC json-disassemble
+@@GROUP schemas
+@@BRIEF --disassemble output schema.
+@@RELATED --disassemble, json
+
+Schema for --disassemble JSON output:
+
+{
+  "file": "output.com",
+  "fileSize": 93,
+  "instructions": [
+    {"addr":N, "bytes":[...], "hex":"B8 05 00", "asm":"MOV AX, 0x0005", "size":3}
+  ],
+  "dataRegions": [
+    {"addr":N, "bytes":[...], "hex":"48 65 6C", "size":3,
+     "msg":"Decode failed or ambiguous"}
+  ]
+}
+
+Uses linear sweep (sequential decode from offset 0).
+Immediates in uppercase hex with 0x prefix.
+Jump targets as absolute addresses.
+String data (DB) appears in dataRegions.
+
+@@EXAMPLES
+agent86 --disassemble output.com
+@@END
+
+@@TOPIC errors
+@@GROUP diagnostics
+@@BRIEF Error diagnostic reference with causes and fixes.
+@@RELATED warnings, --agent
+
+Every error includes an actionable hint field. Read the hint first.
+
+Common errors:
+  "Undefined label X" + "Did you mean 0XH?"
+    Hex literal missing leading zero. Write 0FFh not FFh.
+
+  "Undefined label X" + "Did you mean 'Y'?"
+    Typo in label name. Hint shows closest matching symbol.
+
+  "Undefined label X" + registers hint
+    Register used in expression. Registers can't appear in arithmetic.
+
+  "Undefined label X" + local labels hint
+    .label used outside PROC. Wrap in PROC/ENDP or use global label.
+
+  "Loop jump out of range (N)"
+    Loop body exceeds 127 bytes. Use DEC CX / JNZ target instead.
+
+  "Size mismatch between operands"
+    Mixing 8-bit and 16-bit registers. Hint shows both sizes.
+
+  "Stack ops require 16-bit register"
+    PUSH AL etc. Hint shows 16-bit counterpart.
+
+  "POP CS is not a valid instruction"
+    Use far JMP or far CALL to change CS.
+
+  "Invalid operands for X"
+    Wrong operand combination. Hint shows all valid forms.
+
+  "Invalid numeric literal: X"
+    Malformed number. Hint shows invalid character and valid format.
+
+  "Invalid register in memory operand: X"
+    Used AX/CX/DX/SP inside []. Valid: BX, BP, SI, DI.
+
+  "Invalid addressing mode combination"
+    Illegal register pair. Hint shows all valid 8086 modes.
+
+  "PROC without label"
+    Example: myproc: PROC
+
+  "Extra tokens at end of line"
+    Missing comma, stray character, or comment without ;
+
+  "LEA requires 16-bit register"
+    Use AX..DI, not AL..BH.
+
+  "Division by zero"
+    Check divisor value or EQU constant.
+
+  Macro errors: "without matching ENDM", "reserved name", "iteration limit"
+
+@@END
+
+@@TOPIC warnings
+@@GROUP diagnostics
+@@BRIEF Warning diagnostic reference. Assembly succeeds but issues flagged.
+@@RELATED errors, --agent
+
+Warnings mean assembly succeeded but something may be wrong.
+
+  "uses 80186+ encoding"
+    Shift/rotate with imm > 1. Hint shows MOV CL,N / SHL reg,CL replacement.
+
+  "No size prefix on memory-immediate"
+    MOV [BX], 5 without BYTE/WORD. Add BYTE or WORD prefix.
+
+  "No size prefix on memory shift/rotate"
+    SHL [BX], 1 without BYTE/WORD. Add BYTE or WORD prefix.
+
+  "truncated to 8-bit" / "truncated to 16-bit"
+    Immediate exceeds range. Hint shows truncated result and valid range.
+
+  "ORG directive after code"
+    ORG doesn't move already-emitted code. Place ORG at start.
+
+  "redefined"
+    Label defined more than once. Hint shows previous definition line.
+
+  "Local label outside procedure"
+    .label used without PROC/ENDP. Wrap in PROC/ENDP or use global label.
+
+  "Macro 'X' redefined"
+    Second definition replaces first. Hint shows previous line.
+
+  "Macro 'X' invoked with N args, expected M"
+    Missing args become empty strings; extras ignored.
+
+  "Conditional jump auto-promoted"
+    Jcc target beyond short range. Assembler auto-emitted inverted Jcc + near JMP.
+    INFO-level, not an error. Jump now uses 5 bytes instead of 2.
+
+@@END
+
+@@TOPIC attributes
+@@GROUP reference
+@@BRIEF CGA text-mode attribute byte and color table.
+@@RELATED int10h, --attrs, screen-capture
+
+CGA attribute byte format (1 byte per VRAM cell):
+  Bit 7      Blink
+  Bits 6-4   Background color (0-7)
+  Bits 3-0   Foreground color (0-15)
+
+Color values:
+  0  Black          8  Dark Grey
+  1  Blue           9  Light Blue
+  2  Green          A  Light Green
+  3  Cyan           B  Light Cyan
+  4  Red            C  Light Red
+  5  Magenta        D  Light Magenta
+  6  Brown          E  Yellow
+  7  Light Grey     F  White
+
+Common attribute values:
+  07h  light grey on black (default)
+  0Fh  bright white on black
+  1Fh  white on blue
+  4Eh  yellow on red
+  00h  black on black (invisible!)
+
+Formula: attr = (background << 4) | foreground  (add 80h for blink)
+
+@@EXAMPLES
+MOV AX, 0B800h / MOV ES, AX / MOV BYTE ES:[0], 'A' / MOV BYTE ES:[1], 1Fh
+agent86 --run-source colors.asm --screen --attrs
+@@END

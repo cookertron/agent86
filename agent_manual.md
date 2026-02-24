@@ -76,6 +76,58 @@ agent86 --run hello.com
 | `--output-file <path>` | **Write JSON to file** instead of stdout. Bypasses shell encoding issues (no BOM, no re-encoding). | stdout |
 | `--vram-fill [text]` | **Pre-fill VRAM with known content** before the program runs. With a text argument, tiles the string across all 4000 character cells (80×50). Without an argument, fills with random printable characters. Attribute bytes are left at default (`07h`). Useful for seeing which cells a program actually writes to. | Off |
 | `--dos-root <dir>` | **Mount a host directory** as DOS filesystem root (C:\). Enables file I/O (open/read/write/close) and directory operations (FindFirst/FindNext, chdir). All paths sandboxed within this directory. | Off |
+| `--args <string>` | **Command-line tail** written to PSP at offset 80h. Max 126 characters. | Empty |
+
+### Help Flags
+
+| Flag | Purpose | Output |
+|---|---|---|
+| `--help` | **List all help topics.** Returns a JSON index of every queryable topic with name, group, and brief description. | JSON topic listing |
+| `--help <topic>` | **Show detailed help for a specific topic.** Returns content, examples, and related topics. Topic lookup is case-insensitive. | JSON topic detail |
+
+The help system reads from `agent86.hlp` (located alongside the executable). Topics cover every CLI flag, assembly syntax, directives, macros, structs, the full instruction set, addressing modes, all emulated interrupts, JSON output schemas, and diagnostic references.
+
+```bash
+agent86 --help                    # list all topics
+agent86 --help --agent            # help for --agent flag
+agent86 --help syntax             # assembly syntax reference
+agent86 --help int21h             # INT 21h function table
+agent86 --help nonexistent        # error with list of available topics
+```
+
+**`--help` output (no argument):**
+```json
+{
+  "help": true,
+  "topics": [
+    {"name": "overview", "group": "general", "brief": "Identity, architecture, and quick start guide."},
+    {"name": "--agent", "group": "assembly", "brief": "Primary assembly mode..."},
+    ...
+  ]
+}
+```
+
+**`--help <topic>` output:**
+```json
+{
+  "help": true,
+  "topic": "--agent",
+  "group": "assembly",
+  "brief": "Primary assembly mode. Structured JSON report to stdout.",
+  "content": "Assemble a source file and emit...",
+  "examples": ["agent86 --agent source.asm"],
+  "related": ["--run-source", "--disassemble", "json-agent", "errors", "warnings"]
+}
+```
+
+**`--help <unknown>` output:**
+```json
+{
+  "help": true,
+  "error": "Unknown help topic: foo",
+  "available": ["overview", "--agent", "--run", ...]
+}
+```
 
 ### Flag Usage Patterns
 
@@ -859,6 +911,7 @@ These functions operate on file handles. Handles 0–4 are pre-allocated device 
 | `42h` | Seek (lseek) | Repositions file pointer for handle BX. AL=origin (0=SEEK_SET, 1=SEEK_CUR, 2=SEEK_END). CX:DX=32-bit offset (CX=high, DX=low). Returns new position in DX:AX. CF=1 on error. On device handles, returns DX:AX=0 without error. |
 | `43h` | Get/set file attributes | AL=0: get file attributes into CX. AL=1: set attributes (stub, returns success). CF=1 if file not found. Requires `--dos-root`. |
 | `44h/00` | IOCTL get device info | Returns device information word in DX for handle BX. Bit 7 set = character device. Bit 7 clear = file (bits 5:0 = drive number). CF=1 if invalid handle. |
+| `44h/09` | IOCTL check if block device is remote | BL=drive number (0=default, 1=A:, 2=B:, 3=C:, ...). Default drive maps to C:. Returns DX=0000h (local) and CF=0 for drive C:. CF=1 and AX=0Fh (invalid drive) for all other drives. Used by programs to probe available drives. |
 | `57h` | Get file date/time | AL=0: get file modification time/date for handle BX. Returns CX=packed time, DX=packed date. CF=1 on error. |
 | `4Ch` | Exit with return code | Halts emulation. `exitCode` = AL. |
 

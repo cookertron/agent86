@@ -49,6 +49,14 @@ struct AssemblerState {
     vector<BinaryMap> listing; // The visual "debug" view
 };
 
+// --- Help System ---
+
+struct HelpEntry {
+    string topic, group, brief, content;
+    vector<string> related;
+    vector<string> examples;
+};
+
 // --- Lexer Types ---
 enum class TokenType {
     LabelDef, // label:
@@ -3890,6 +3898,8 @@ struct EmulatorConfig {
     // --- VRAM fill ---
     bool vramFill = false;
     string vramFillText;     // empty = random fill
+    // --- Command-line args ---
+    string commandArgs;      // --args value → PSP command tail
 };
 
 struct Snapshot {
@@ -4733,6 +4743,19 @@ void handleInt21(CPU& cpu, Memory& mem, IOCapture& io, EmulatorResult& result, V
                     // For files: info = 0 (block device, not EOF, etc.)
                     cpu.regs[2] = info; // DX = device info word
                     cpu.setFlag(CPU::CF, false);
+                } else if (al == 0x09) { // Check if block device is remote
+                    // BL = drive number (0=default, 1=A:, 2=B:, 3=C:, ...)
+                    uint8_t drive = cpu.getReg8(2); // BL
+                    if (drive == 0) drive = 3; // default = C:
+                    if (drive == 3) { // C: is our emulated drive
+                        // DX bit 12 = 0 (local), bit 9 = 0 (not shared)
+                        cpu.regs[2] = 0x0000; // local, not remote
+                        cpu.setFlag(CPU::CF, false);
+                    } else {
+                        cpu.setFlag(CPU::CF, true);
+                        cpu.regs[0] = 0x0F; // invalid drive
+                        dosFs.errors++;
+                    }
                 } else {
                     // Other IOCTL subfunctions: stub
                     cpu.setFlag(CPU::CF, true);
@@ -5871,6 +5894,19 @@ EmulatorResult runEmulator(const vector<uint8_t>& binary, const EmulatorConfig& 
     mem.loadCOM(binary);
     mem.write8(0x0000, 0xCD); // INT 20h at PSP:0000
     mem.write8(0x0001, 0x20);
+
+    // Write command-line tail to PSP (0x80 = length, 0x81+ = tail + CR)
+    if (!config.commandArgs.empty()) {
+        string tail = " " + config.commandArgs;  // leading space per DOS convention
+        if (tail.size() > 126) tail.resize(126); // max 126 chars + CR
+        mem.write8(0x0080, (uint8_t)tail.size());
+        for (size_t i = 0; i < tail.size(); i++)
+            mem.write8(0x0081 + (uint16_t)i, (uint8_t)tail[i]);
+        mem.write8(0x0081 + (uint16_t)tail.size(), 0x0D); // CR terminator
+    } else {
+        mem.write8(0x0080, 0);    // zero-length tail
+        mem.write8(0x0081, 0x0D); // CR terminator
+    }
 
     // Code vector for decoder
     vector<uint8_t> code(mem.data, mem.data + 65536);
@@ -7401,6 +7437,116 @@ static bool expandMacros(
 }
 
 // ============================================================
+// HELP SYSTEM
+// ============================================================
+
+static vector<HelpEntry> loadHelp(const string& path) {
+    vector<HelpEntry> entries;
+    ifstream f(path);
+    if (!f) return entries;
+    HelpEntry cur;
+    bool inTopic = false;
+    string line;
+    while (getline(f, line)) {
+        // Strip trailing \r for Windows line endings
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+
+        if (line.rfind("@@TOPIC ", 0) == 0) {
+            if (inTopic) entries.push_back(cur);
+            cur = HelpEntry();
+            cur.topic = line.substr(8);
+            inTopic = true;
+        } else if (line.rfind("@@GROUP ", 0) == 0 && inTopic) {
+            cur.group = line.substr(8);
+        } else if (line.rfind("@@BRIEF ", 0) == 0 && inTopic) {
+            cur.brief = line.substr(8);
+        } else if (line.rfind("@@RELATED ", 0) == 0 && inTopic) {
+            stringstream ss(line.substr(10));
+            string tok;
+            while (getline(ss, tok, ',')) {
+                // Trim whitespace
+                size_t s = tok.find_first_not_of(' ');
+                size_t e = tok.find_last_not_of(' ');
+                if (s != string::npos) cur.related.push_back(tok.substr(s, e - s + 1));
+            }
+        } else if (line == "@@EXAMPLES" && inTopic) {
+            // Trim content collected so far
+            while (!cur.content.empty() && cur.content.front() == '\n') cur.content.erase(0, 1);
+            while (!cur.content.empty() && cur.content.back() == '\n') cur.content.pop_back();
+            // Read example lines until @@END
+            while (getline(f, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (line == "@@END") {
+                    entries.push_back(cur);
+                    cur = HelpEntry();
+                    inTopic = false;
+                    break;
+                }
+                // Skip blank lines; non-blank lines are examples
+                size_t first = line.find_first_not_of(' ');
+                if (first != string::npos) {
+                    cur.examples.push_back(line.substr(first));
+                }
+            }
+        } else if (line == "@@END" && inTopic) {
+            // Trim leading/trailing newlines from content
+            while (!cur.content.empty() && cur.content.front() == '\n') cur.content.erase(0, 1);
+            while (!cur.content.empty() && cur.content.back() == '\n') cur.content.pop_back();
+            entries.push_back(cur);
+            cur = HelpEntry();
+            inTopic = false;
+        } else if (inTopic) {
+            cur.content += line + "\n";
+        }
+    }
+    if (inTopic) entries.push_back(cur);
+    return entries;
+}
+
+static void emitHelpIndex(const vector<HelpEntry>& entries) {
+    cout << "{\"help\":true,\"topics\":[";
+    for (size_t i = 0; i < entries.size(); ++i) {
+        if (i) cout << ",";
+        cout << "{\"name\":\"" << jsonEscape(entries[i].topic) << "\""
+             << ",\"group\":\"" << jsonEscape(entries[i].group) << "\""
+             << ",\"brief\":\"" << jsonEscape(entries[i].brief) << "\"}";
+    }
+    cout << "]}" << endl;
+}
+
+static void emitHelpTopic(const HelpEntry& e) {
+    cout << "{\"help\":true"
+         << ",\"topic\":\"" << jsonEscape(e.topic) << "\""
+         << ",\"group\":\"" << jsonEscape(e.group) << "\""
+         << ",\"brief\":\"" << jsonEscape(e.brief) << "\""
+         << ",\"content\":\"" << jsonEscape(e.content) << "\"";
+    if (!e.examples.empty()) {
+        cout << ",\"examples\":[";
+        for (size_t i = 0; i < e.examples.size(); ++i) {
+            if (i) cout << ",";
+            cout << "\"" << jsonEscape(e.examples[i]) << "\"";
+        }
+        cout << "]";
+    }
+    cout << ",\"related\":[";
+    for (size_t i = 0; i < e.related.size(); ++i) {
+        if (i) cout << ",";
+        cout << "\"" << jsonEscape(e.related[i]) << "\"";
+    }
+    cout << "]}" << endl;
+}
+
+static void emitHelpError(const string& topic, const vector<HelpEntry>& entries) {
+    cout << "{\"help\":true,\"error\":\"Unknown help topic: " << jsonEscape(topic) << "\""
+         << ",\"available\":[";
+    for (size_t i = 0; i < entries.size(); ++i) {
+        if (i) cout << ",";
+        cout << "\"" << jsonEscape(entries[i].topic) << "\"";
+    }
+    cout << "]}" << endl;
+}
+
+// ============================================================
 // MAIN
 // ============================================================
 
@@ -7418,7 +7564,37 @@ int main(int argc, char* argv[]) {
     // Arg parsing
     for(int i=1; i<argc; ++i) {
         string arg = argv[i];
-        if(arg == "--agent") {
+        if(arg == "--help" || arg == "-h") {
+            namespace fs = std::filesystem;
+            fs::path helpPath = fs::path(argv[0]).parent_path() / "agent86.hlp";
+            vector<HelpEntry> helpEntries = loadHelp(helpPath.string());
+            if (helpEntries.empty()) {
+                cout << "{\"help\":true,\"error\":\"Cannot load help file: "
+                     << jsonEscape(helpPath.string()) << "\"}" << endl;
+                return 1;
+            }
+            // Check if next arg is a topic name
+            if (i + 1 < argc) {
+                string topic = argv[i + 1];
+                // Find matching topic (case-insensitive, also try with -- prefix)
+                string topicLower = topic;
+                transform(topicLower.begin(), topicLower.end(), topicLower.begin(), ::tolower);
+                const HelpEntry* found = nullptr;
+                for (const auto& e : helpEntries) {
+                    string eName = e.topic;
+                    transform(eName.begin(), eName.end(), eName.begin(), ::tolower);
+                    if (eName == topicLower) { found = &e; break; }
+                }
+                if (found) {
+                    emitHelpTopic(*found);
+                } else {
+                    emitHelpError(topic, helpEntries);
+                }
+            } else {
+                emitHelpIndex(helpEntries);
+            }
+            return 0;
+        } else if(arg == "--agent") {
             agentMode = true;
         } else if (arg == "--explain") {
             if (i + 1 < argc) {
@@ -7465,6 +7641,9 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--input" && i + 1 < argc) {
             ++i;
             emuConfig.stdinInput = unescapeInput(argv[i]);
+        } else if (arg == "--args" && i + 1 < argc) {
+            ++i;
+            emuConfig.commandArgs = argv[i];
         } else if (arg == "--mem-dump" && i + 1 < argc) {
             ++i;
             string mdarg = argv[i];
