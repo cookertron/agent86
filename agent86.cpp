@@ -3355,7 +3355,7 @@ struct CPU {
 };
 
 struct Memory {
-    uint8_t data[65536] = {};
+    uint8_t data[1048576] = {};
     uint8_t vram[16000] = {};      // 2 pages of 80x50x2 bytes (char + attr interleaved)
     bool vramDirty = false;         // Track if VRAM was touched this cycle
 
@@ -3375,7 +3375,7 @@ struct Memory {
         uint32_t linear = (uint32_t)seg * 16 + off;
         if (linear >= 0xB8000 && linear < 0xBBE80)
             return vram[linear - 0xB8000];
-        return data[off & 0xFFFF];   // Flat fallback
+        return (linear < 1048576) ? data[linear] : 0;
     }
 
     uint16_t sread16(uint16_t seg, uint16_t off) const {
@@ -3386,8 +3386,11 @@ struct Memory {
             uint8_t hi = (idx + 1 < 16000) ? vram[idx + 1] : 0;
             return lo | ((uint16_t)hi << 8);
         }
-        return data[off & 0xFFFF] |
-               ((uint16_t)data[(uint16_t)((off + 1) & 0xFFFF)] << 8);
+        if (linear + 1 < 1048576)
+            return data[linear] | ((uint16_t)data[linear + 1] << 8);
+        if (linear < 1048576)
+            return data[linear];
+        return 0;
     }
 
     void swrite8(uint16_t seg, uint16_t off, uint8_t val) {
@@ -3397,7 +3400,7 @@ struct Memory {
             vramDirty = true;
             return;
         }
-        data[off & 0xFFFF] = val;
+        if (linear < 1048576) data[linear] = val;
     }
 
     void swrite16(uint16_t seg, uint16_t off, uint16_t val) {
@@ -3409,8 +3412,8 @@ struct Memory {
             vramDirty = true;
             return;
         }
-        data[off & 0xFFFF] = (uint8_t)(val & 0xFF);
-        data[(uint16_t)((off + 1) & 0xFFFF)] = (uint8_t)(val >> 8);
+        if (linear < 1048576) data[linear] = (uint8_t)(val & 0xFF);
+        if (linear + 1 < 1048576) data[linear + 1] = (uint8_t)(val >> 8);
     }
 
     void loadCOM(const vector<uint8_t>& binary) {
@@ -3555,6 +3558,73 @@ struct DOSFileState {
     int bytesWritten = 0;
     int dirSearches = 0;
     int errors = 0;
+};
+
+struct DOSMemoryState {
+    // Simple paragraph-based allocator for conventional memory above the COM segment.
+    // COM program occupies segment 0x0000 (64KB). Allocatable memory starts at 0x1000.
+    struct Block {
+        uint16_t segment;    // start paragraph
+        uint16_t size;       // size in paragraphs
+    };
+    vector<Block> allocated;
+    uint16_t nextFreeSeg = 0x1000;   // first allocatable paragraph (after COM's 64KB)
+    uint16_t maxSeg = 0xA000;        // 640KB conventional memory ceiling
+
+    // Allocate `paragraphs` paragraphs. Returns segment on success, 0 on failure.
+    uint16_t allocate(uint16_t paragraphs) {
+        if (paragraphs == 0) paragraphs = 1;
+        if ((uint32_t)nextFreeSeg + paragraphs > maxSeg) return 0;
+        uint16_t seg = nextFreeSeg;
+        nextFreeSeg += paragraphs;
+        allocated.push_back({seg, paragraphs});
+        return seg;
+    }
+
+    // Free a previously allocated block. Returns true on success.
+    bool free(uint16_t segment) {
+        for (size_t i = 0; i < allocated.size(); i++) {
+            if (allocated[i].segment == segment) {
+                // If this is the topmost block, reclaim space
+                if (allocated[i].segment + allocated[i].size == nextFreeSeg) {
+                    nextFreeSeg = allocated[i].segment;
+                }
+                allocated.erase(allocated.begin() + i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Resize a previously allocated block. Returns true on success.
+    bool resize(uint16_t segment, uint16_t newSize) {
+        if (newSize == 0) newSize = 1;
+        for (size_t i = 0; i < allocated.size(); i++) {
+            if (allocated[i].segment == segment) {
+                // Only the topmost block can be resized
+                if (allocated[i].segment + allocated[i].size == nextFreeSeg) {
+                    uint32_t newEnd = (uint32_t)allocated[i].segment + newSize;
+                    if (newEnd > maxSeg) return false;
+                    nextFreeSeg = (uint16_t)newEnd;
+                    allocated[i].size = newSize;
+                    return true;
+                }
+                // Non-topmost: can shrink but not grow
+                if (newSize <= allocated[i].size) {
+                    allocated[i].size = newSize;
+                    return true;
+                }
+                return false;
+            }
+        }
+        return false;
+    }
+
+    // Returns largest free block in paragraphs
+    uint16_t largestFree() const {
+        if (nextFreeSeg >= maxSeg) return 0;
+        return maxSeg - nextFreeSeg;
+    }
 };
 
 // Convert DOS path to sandboxed host path. Returns empty string and sets error on failure.
@@ -4319,7 +4389,8 @@ static void processEvents(EventState& evState, int cycle, MouseState& mouse, IOC
 
 void handleInt21(CPU& cpu, Memory& mem, IOCapture& io, EmulatorResult& result, VRAMState& vram,
                  EventState& evState, MouseState& mouse, const vector<uint8_t>& code,
-                 const EmulatorConfig& config, int cycle, DOSFileState& dosFs) {
+                 const EmulatorConfig& config, int cycle, DOSFileState& dosFs,
+                 DOSMemoryState& dosMem) {
     static const int MAX_OUTPUT = 4096;
     evState.counters.int21Count++;
     uint8_t ah = cpu.getReg8(4); // AH
@@ -5018,6 +5089,41 @@ void handleInt21(CPU& cpu, Memory& mem, IOCapture& io, EmulatorResult& result, V
             cpu.setFlag(CPU::CF, false);
             break;
         }
+        case 0x48: { // Allocate memory - BX = paragraphs requested
+            uint16_t requested = cpu.regs[3]; // BX
+            uint16_t seg = dosMem.allocate(requested);
+            if (seg != 0) {
+                cpu.regs[0] = seg;  // AX = segment of allocated block
+                cpu.setFlag(CPU::CF, false);
+            } else {
+                cpu.regs[0] = 8;    // AX = error 8 (insufficient memory)
+                cpu.regs[3] = dosMem.largestFree(); // BX = largest available
+                cpu.setFlag(CPU::CF, true);
+            }
+            break;
+        }
+        case 0x49: { // Free memory - ES = segment to free
+            uint16_t seg = cpu.sregs[0]; // ES
+            if (dosMem.free(seg)) {
+                cpu.setFlag(CPU::CF, false);
+            } else {
+                cpu.regs[0] = 9;    // AX = error 9 (invalid memory block)
+                cpu.setFlag(CPU::CF, true);
+            }
+            break;
+        }
+        case 0x4A: { // Resize memory block - ES = segment, BX = new size in paragraphs
+            uint16_t seg = cpu.sregs[0]; // ES
+            uint16_t newSize = cpu.regs[3]; // BX
+            if (dosMem.resize(seg, newSize)) {
+                cpu.setFlag(CPU::CF, false);
+            } else {
+                cpu.regs[0] = 8;    // AX = error 8 (insufficient memory)
+                cpu.regs[3] = dosMem.largestFree(); // BX = largest available
+                cpu.setFlag(CPU::CF, true);
+            }
+            break;
+        }
         default: {
             result.skipped.push_back({ cpu.ip, "INT 21h AH=" + hexByte(ah), "Unimplemented DOS function", 1 });
             break;
@@ -5139,13 +5245,14 @@ void handleInt16(CPU& cpu, IOCapture& io, EmulatorResult& result) {
 void handleInterrupt(CPU& cpu, Memory& mem, IOCapture& io, EmulatorResult& result,
                      uint8_t intNum, VRAMState& vram, MouseState& mouse,
                      EventState& evState, const vector<uint8_t>& code,
-                     const EmulatorConfig& config, int cycle, DOSFileState& dosFs) {
+                     const EmulatorConfig& config, int cycle, DOSFileState& dosFs,
+                     DOSMemoryState& dosMem) {
     if (intNum == 0x20) {
         result.halted = true;
         result.haltReason = "INT 20h program terminate";
         result.exitCode = 0;
     } else if (intNum == 0x21) {
-        handleInt21(cpu, mem, io, result, vram, evState, mouse, code, config, cycle, dosFs);
+        handleInt21(cpu, mem, io, result, vram, evState, mouse, code, config, cycle, dosFs, dosMem);
     } else if (intNum == 0x10) {
         handleInt10(cpu, mem, vram, result);
     } else if (intNum == 0x16) {
@@ -5161,7 +5268,8 @@ void handleInterrupt(CPU& cpu, Memory& mem, IOCapture& io, EmulatorResult& resul
 
 void executeInstruction(CPU& cpu, Memory& mem, IOCapture& io, const DecodedInst& inst,
                         EmulatorResult& result, vector<uint8_t>& code, bool& memDirty, VRAMState& vram, MouseState& mouse,
-                        EventState& evState, const EmulatorConfig& config, int cycle, DOSFileState& dosFs) {
+                        EventState& evState, const EmulatorConfig& config, int cycle, DOSFileState& dosFs,
+                        DOSMemoryState& dosMem) {
     const string& mn = inst.mnemonic;
 
     // --- ALU: ADD, ADC, SUB, SBB, CMP, AND, OR, XOR, TEST ---
@@ -5456,13 +5564,13 @@ void executeInstruction(CPU& cpu, Memory& mem, IOCapture& io, const DecodedInst&
     else if (mn == "PUSH") {
         uint16_t val = readOperand(cpu, mem, inst.op1, inst.segOverride);
         cpu.regs[4] -= 2;  // SP -= 2
-        mem.write16(cpu.regs[4], val);
+        mem.swrite16(cpu.sregs[2], cpu.regs[4], val);
         memDirty = true;
     }
 
     // --- POP ---
     else if (mn == "POP") {
-        uint16_t val = mem.read16(cpu.regs[4]);
+        uint16_t val = mem.sread16(cpu.sregs[2], cpu.regs[4]);
         cpu.regs[4] += 2;  // SP += 2
         writeOperand(cpu, mem, inst.op1, val, memDirty, inst.segOverride);
     }
@@ -5482,7 +5590,7 @@ void executeInstruction(CPU& cpu, Memory& mem, IOCapture& io, const DecodedInst&
     else if (mn == "CALL") {
         uint16_t nextIP = cpu.ip; // already advanced
         cpu.regs[4] -= 2;
-        mem.write16(cpu.regs[4], nextIP);
+        mem.swrite16(cpu.sregs[2], cpu.regs[4], nextIP);
         memDirty = true;
         if (inst.jumpTarget >= 0) {
             cpu.ip = (uint16_t)inst.jumpTarget;
@@ -5494,7 +5602,7 @@ void executeInstruction(CPU& cpu, Memory& mem, IOCapture& io, const DecodedInst&
 
     // --- RET ---
     else if (mn == "RET") {
-        cpu.ip = mem.read16(cpu.regs[4]);
+        cpu.ip = mem.sread16(cpu.sregs[2], cpu.regs[4]);
         cpu.regs[4] += 2;
     }
 
@@ -5590,11 +5698,11 @@ void executeInstruction(CPU& cpu, Memory& mem, IOCapture& io, const DecodedInst&
     // --- PUSHF / POPF ---
     else if (mn == "PUSHF") {
         cpu.regs[4] -= 2;
-        mem.write16(cpu.regs[4], cpu.flags);
+        mem.swrite16(cpu.sregs[2], cpu.regs[4], cpu.flags);
         memDirty = true;
     }
     else if (mn == "POPF") {
-        cpu.flags = mem.read16(cpu.regs[4]);
+        cpu.flags = mem.sread16(cpu.sregs[2], cpu.regs[4]);
         cpu.regs[4] += 2;
     }
 
@@ -5634,8 +5742,8 @@ void executeInstruction(CPU& cpu, Memory& mem, IOCapture& io, const DecodedInst&
         int order[] = {0, 1, 2, 3, 4, 5, 6, 7};
         for (int r : order) {
             cpu.regs[4] -= 2;
-            if (r == 4) mem.write16(cpu.regs[4], origSP);
-            else        mem.write16(cpu.regs[4], cpu.regs[r]);
+            if (r == 4) mem.swrite16(cpu.sregs[2], cpu.regs[4], origSP);
+            else        mem.swrite16(cpu.sregs[2], cpu.regs[4], cpu.regs[r]);
         }
         memDirty = true;
     }
@@ -5643,20 +5751,20 @@ void executeInstruction(CPU& cpu, Memory& mem, IOCapture& io, const DecodedInst&
     // --- POPA (80186+) ---
     else if (mn == "POPA") {
         // Pop order: DI, SI, BP, (skip SP), BX, DX, CX, AX
-        cpu.regs[7] = mem.read16(cpu.regs[4]); cpu.regs[4] += 2; // DI
-        cpu.regs[6] = mem.read16(cpu.regs[4]); cpu.regs[4] += 2; // SI
-        cpu.regs[5] = mem.read16(cpu.regs[4]); cpu.regs[4] += 2; // BP
-        cpu.regs[4] += 2;                                          // skip SP
-        cpu.regs[3] = mem.read16(cpu.regs[4]); cpu.regs[4] += 2; // BX
-        cpu.regs[2] = mem.read16(cpu.regs[4]); cpu.regs[4] += 2; // DX
-        cpu.regs[1] = mem.read16(cpu.regs[4]); cpu.regs[4] += 2; // CX
-        cpu.regs[0] = mem.read16(cpu.regs[4]); cpu.regs[4] += 2; // AX
+        cpu.regs[7] = mem.sread16(cpu.sregs[2], cpu.regs[4]); cpu.regs[4] += 2; // DI
+        cpu.regs[6] = mem.sread16(cpu.sregs[2], cpu.regs[4]); cpu.regs[4] += 2; // SI
+        cpu.regs[5] = mem.sread16(cpu.sregs[2], cpu.regs[4]); cpu.regs[4] += 2; // BP
+        cpu.regs[4] += 2;                                                          // skip SP
+        cpu.regs[3] = mem.sread16(cpu.sregs[2], cpu.regs[4]); cpu.regs[4] += 2; // BX
+        cpu.regs[2] = mem.sread16(cpu.sregs[2], cpu.regs[4]); cpu.regs[4] += 2; // DX
+        cpu.regs[1] = mem.sread16(cpu.sregs[2], cpu.regs[4]); cpu.regs[4] += 2; // CX
+        cpu.regs[0] = mem.sread16(cpu.sregs[2], cpu.regs[4]); cpu.regs[4] += 2; // AX
     }
 
     // --- INT ---
     else if (mn == "INT") {
         uint8_t intNum = (uint8_t)(inst.op1.disp & 0xFF);
-        handleInterrupt(cpu, mem, io, result, intNum, vram, mouse, evState, code, config, cycle, dosFs);
+        handleInterrupt(cpu, mem, io, result, intNum, vram, mouse, evState, code, config, cycle, dosFs, dosMem);
     }
 
     // --- IN / OUT ---
@@ -5816,7 +5924,8 @@ static bool writeScreenshot(const uint8_t vram[16000],
 EmulatorResult runEmulator(const vector<uint8_t>& binary, const EmulatorConfig& config, CPU& cpuOut) {
     EmulatorResult result;
     CPU cpu;
-    Memory mem;
+    static Memory mem;  // static: 1MB+ too large for stack
+    memset(&mem, 0, sizeof(mem)); // zero-initialize each call
     VRAMState vram;
     MouseState mouse;
     IOCapture io;
@@ -5842,6 +5951,9 @@ EmulatorResult runEmulator(const vector<uint8_t>& binary, const EmulatorConfig& 
     // Init events
     EventState evState;
     evState.events = config.events;
+
+    // Init DOS memory state
+    DOSMemoryState dosMem;
 
     // Init DOS file state
     DOSFileState dosFs;
@@ -5942,7 +6054,7 @@ EmulatorResult runEmulator(const vector<uint8_t>& binary, const EmulatorConfig& 
         cpu.ip = (uint16_t)(cpu.ip + inst.size);
 
         // Execute
-        executeInstruction(cpu, mem, io, inst, result, code, memDirty, vram, mouse, evState, config, cycle, dosFs);
+        executeInstruction(cpu, mem, io, inst, result, code, memDirty, vram, mouse, evState, config, cycle, dosFs, dosMem);
         cycle++;
 
         // Process tick-based events

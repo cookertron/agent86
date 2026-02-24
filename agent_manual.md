@@ -871,7 +871,7 @@ Halts emulation with `exitCode: 0`. This is the standard .COM termination method
 
 ### INT 21h — DOS Function Calls
 
-The emulator implements 28 INT 21h functions organized into four categories: console I/O, system information, file handle I/O, and directory operations. Any unimplemented AH value is logged in `skipped[]` as `"Unimplemented DOS function"`.
+The emulator implements 31 INT 21h functions organized into five categories: console I/O, system information, memory management, file handle I/O, and directory operations. Any unimplemented AH value is logged in `skipped[]` as `"Unimplemented DOS function"`.
 
 #### Console I/O Functions
 
@@ -896,6 +896,33 @@ The emulator implements 28 INT 21h functions organized into four categories: con
 | `30h` | Get DOS version | Returns AL=5 (major), AH=0 (minor). Reports as DOS 5.0. |
 | `35h` | Get interrupt vector | Stub — returns ES:BX=0000:0000. |
 | `62h` | Get PSP segment | Returns BX=0 (PSP segment base). |
+
+#### Memory Management Functions
+
+The emulator provides a 1MB address space with a paragraph-based memory allocator. The COM program occupies the first 64KB (segment 0). Allocatable memory spans segments 0x1000–0x9FFF (576KB of conventional memory). Allocation is linear (bump allocator); only the topmost block can be grown via resize.
+
+| AH | Function | Behavior |
+|---|---|---|
+| `48h` | Allocate memory | Allocates BX paragraphs (16-byte units). Returns allocated segment in AX, CF=0. On failure: CF=1, AX=8 (insufficient memory), BX=largest available block in paragraphs. |
+| `49h` | Free memory | Frees the block at segment ES. CF=0 on success. CF=1, AX=9 (invalid memory block address) if ES doesn't match any allocated block. |
+| `4Ah` | Resize memory block | Resizes the block at segment ES to BX paragraphs. CF=0 on success. CF=1, AX=8, BX=largest available if the block can't be resized. Only the topmost allocated block can be grown; any block can be shrunk. |
+
+**Usage example:**
+```asm
+; Allocate 4KB (256 paragraphs)
+MOV AH, 48h
+MOV BX, 100h        ; 256 paragraphs = 4096 bytes
+INT 21h
+JC  alloc_failed    ; CF=1 means failure
+MOV ES, AX          ; ES = allocated segment
+
+; Use the memory via ES:[offset]
+MOV BYTE ES:[0], 42h
+
+; Free the block
+MOV AH, 49h
+INT 21h             ; ES still points to the block
+```
 
 #### File Handle I/O Functions
 

@@ -1058,7 +1058,7 @@ MOV AH, 4Ch / MOV AL, 0 / INT 21h
 @@BRIEF DOS function calls (INT 21h) -- all subfunctions.
 @@RELATED interrupts, file-io, --dos-root, --input
 
-28 implemented functions in four categories.
+31 implemented functions in five categories.
 
 Console I/O:
   AH=01h  Read char with echo    -> AL=char (0Dh if input exhausted)
@@ -1078,6 +1078,14 @@ System:
   AH=30h  Get DOS version        -> AL=5, AH=0 (DOS 5.0)
   AH=35h  Get interrupt vector   stub -> ES:BX=0000:0000
   AH=62h  Get PSP segment        -> BX=0
+
+Memory management:
+  AH=48h  Allocate memory        BX=paragraphs -> AX=segment (CF=0)
+                                  On failure: CF=1, AX=8, BX=largest free
+  AH=49h  Free memory            ES=segment -> CF=0 on success
+                                  On failure: CF=1, AX=9 (invalid block)
+  AH=4Ah  Resize memory block    ES=segment, BX=new paragraphs -> CF=0
+                                  On failure: CF=1, AX=8, BX=largest free
 
 File handle I/O (handles 5+ require --dos-root):
   AH=3Ch  Create file            DS:DX=path, CX=attr -> AX=handle
@@ -1107,6 +1115,8 @@ MOV AH, 01h / INT 21h
 MOV AH, 4Ch / MOV AL, 0 / INT 21h
 MOV AH, 3Dh / MOV AL, 0 / MOV DX, filename / INT 21h / JC error
 MOV AH, 4Eh / MOV CX, 0 / MOV DX, pattern / INT 21h / JC done
+MOV AH, 48h / MOV BX, 100h / INT 21h / JC error  ; allocate 256 paragraphs (4KB)
+MOV ES, AX / MOV AH, 49h / INT 21h               ; free the block
 @@END
 
 @@TOPIC int33h
