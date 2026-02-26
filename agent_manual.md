@@ -64,7 +64,7 @@ agent86 --run hello.com
 | `--breakpoints <addr1,addr2,...>` | Set breakpoints at hex addresses (comma-separated). | None |
 | `--watch-regs <reg1,reg2,...>` | Watch registers for changes. Emits snapshots when watched registers change. | None |
 | `--max-cycles <N>` | Maximum CPU cycles before forced halt. | 1000000 |
-| `--input <string>` | Provide stdin input for the program (consumed by INT 21h/01h and 06h). Supports escapes: `\xHH`, `\0`, `\n`, `\r`, `\t`, `\\`, and `\S` (shift-held prefix — see [INT 16h](#int-16h--bios-keyboard-services)). | Empty |
+| `--input <string>` | Provide stdin input for the program (consumed by INT 21h/01h and 06h). Supports escapes: `\xHH`, `\0`, `\n`, `\r`, `\t`, `\\`, `\S` (shift), `\C` (ctrl), `\A` (alt). Modifier prefixes are stackable. See [INT 16h](#int-16h--bios-keyboard-services). | Empty |
 | `--mem-dump <addr,len>` | Include memory dump in breakpoint snapshots. Address in hex, length in decimal. | None |
 | `--screen` | **Capture full 80×50 screen** from VRAM into JSON output. | Off |
 | `--viewport <col,row,w,h>` | **Capture a rectangular region** of the screen. Implies `--screen` behavior but only for the specified window. | Off |
@@ -232,9 +232,11 @@ agent86 --run-source app.asm --events '[{"on":"poll:3","mouse":[320,100,1]},{"on
 agent86 --run-source app.asm --events @events.json
 ```
 
-**Provide shifted keys (for INT 16h/02h shift detection):**
+**Provide modifier keys (for INT 16h/02h shift/ctrl/alt detection):**
 ```bash
 agent86 --run-source arrows.asm --input "\S\x00\S\x4B"
+agent86 --run-source editor.asm --input "\Cs"          # Ctrl+S
+agent86 --run-source editor.asm --input "\A\Cd"        # Alt+Ctrl+D
 ```
 
 **Mount a host directory for DOS file I/O:**
@@ -427,6 +429,8 @@ If assembly fails, the `emulation` section will have `success: false` with no me
 - `bytesRead`: Total bytes read from files (AH=3Fh on file handles, not device handles).
 - `bytesWritten`: Total bytes written to files (AH=40h on file handles, not device handles).
 - `dirSearches`: Number of FindFirst calls (AH=4Eh).
+- `filesDeleted`: Number of files deleted (AH=41h).
+- `filesRenamed`: Number of files renamed/moved (AH=56h).
 - `errors`: Number of failed file operations (CF=1 returns).
 
 Example:
@@ -437,6 +441,8 @@ Example:
   "bytesRead": 128,
   "bytesWritten": 0,
   "dirSearches": 1,
+  "filesDeleted": 0,
+  "filesRenamed": 0,
   "errors": 0
 }
 ```
@@ -456,7 +462,7 @@ The `--run` flag runs a pre-compiled `.COM` binary. The JSON output is the same 
 - `screenAttrs[]`: Attribute hex strings (when `--attrs` is also used).
 - `screenshot`: Path to rendered BMP file (when `--screenshot` is used and the file was written successfully).
 - `events` *(only when `--events` is used)*: Object with `total`, `fired`, `pending`, and `log[]`. See [Event Scripting](#event-scripting).
-- `fileIO` *(only when `--dos-root` is used and file operations occurred)*: Object with `filesOpened`, `filesClosed`, `bytesRead`, `bytesWritten`, `dirSearches`, and `errors`. See [Emulation Field Reference](#emulation-field-reference).
+- `fileIO` *(only when `--dos-root` is used and file operations occurred)*: Object with `filesOpened`, `filesClosed`, `bytesRead`, `bytesWritten`, `dirSearches`, `filesDeleted`, `filesRenamed`, and `errors`. See [Emulation Field Reference](#emulation-field-reference).
 
 ---
 
@@ -835,17 +841,28 @@ Common attribute values: `07h` = light grey on black (default), `1Fh` = white on
 |-----|---------|
 | 0 | Right Shift held |
 | 1 | Left Shift held |
-| 2 | Ctrl held (not yet emulated) |
-| 3 | Alt held (not yet emulated) |
+| 2 | Ctrl held |
+| 3 | Alt held |
 | 4–7 | Lock states (not emulated) |
 
-**How shift state is driven:**
+**How modifier state is driven:**
 
-The emulator tracks a `shiftFlags` byte that is set by a `\S` prefix in the `--input` string (or event `keys`). When `\S` precedes a byte in the input stream, that byte is delivered with Left Shift (bit 1) set. The shift state persists after key consumption, so a program that reads a key via INT 21h/06h and then immediately calls INT 16h/02h will see the correct flags.
+The emulator tracks a `shiftFlags` byte that is set by prefix escapes in the `--input` string (or event `keys`):
 
-- **Single-byte shifted key:** `\SA` — delivers `'A'` with shift held.
+| Escape | Bit | Modifier |
+|--------|-----|----------|
+| `\S` | 1 | Left Shift |
+| `\C` | 2 | Ctrl |
+| `\A` | 3 | Alt |
+
+Prefixes are **stackable** — multiple can precede a single byte, and their bits are OR'd together. The modifier state persists after key consumption, so a program that reads a key via INT 21h/06h and then immediately calls INT 16h/02h will see the correct flags.
+
+- **Shifted key:** `\SA` — delivers `'A'` with shift held.
+- **Ctrl key:** `\Ca` — delivers `'a'` with Ctrl held.
+- **Alt key:** `\Aa` — delivers `'a'` with Alt held.
+- **Stacked modifiers:** `\C\Sa` — delivers `'a'` with Ctrl+Shift. `\A\C\Sa` — all three.
 - **Extended shifted key (two bytes):** `\S\x00\S\x4B` — delivers the extended-key pair `00h, 4Bh` (Left arrow) with shift held for both reads.
-- **Unshifted key:** any byte not preceded by `\S` clears the shift flags.
+- **Unmodified key:** any byte not preceded by a modifier prefix clears all flags.
 
 > **Common pattern — detect Shift+arrow:**
 > ```asm
@@ -861,7 +878,7 @@ The emulator tracks a `shiftFlags` byte that is set by a `\S` prefix in the `--i
 > ; Now check shift state
 > MOV AH, 02h
 > INT 16h              ; AL = shift flags
-> AND AL, 03h          ; Isolate Shift bits
+> AND AL, 03h          ; Isolate Shift bits (use 0Ch for Ctrl+Alt, 0Fh for all)
 > JNZ shifted_arrow
 > ```
 
@@ -935,10 +952,12 @@ These functions operate on file handles. Handles 0–4 are pre-allocated device 
 | `3Eh` | Close file | Closes handle in BX. Closing device handles (0–4) is a silent no-op. CF=1 if invalid handle. |
 | `3Fh` | Read file/device | Reads CX bytes from handle BX into buffer at DS:DX. Returns AX=bytes actually read. Returns AX=0 at EOF. CF=1 on error. |
 | `40h` | Write file/device | Writes CX bytes from buffer at DS:DX to handle BX. Returns AX=bytes written. CF=1 on error. |
+| `41h` | Delete file | Deletes file at DS:DX path. Cannot delete directories (returns AX=5). CF=1 on error: AX=2 (file not found), AX=3 (path not found), AX=5 (access denied). Requires `--dos-root`. |
 | `42h` | Seek (lseek) | Repositions file pointer for handle BX. AL=origin (0=SEEK_SET, 1=SEEK_CUR, 2=SEEK_END). CX:DX=32-bit offset (CX=high, DX=low). Returns new position in DX:AX. CF=1 on error. On device handles, returns DX:AX=0 without error. |
 | `43h` | Get/set file attributes | AL=0: get file attributes into CX. AL=1: set attributes (stub, returns success). CF=1 if file not found. Requires `--dos-root`. |
 | `44h/00` | IOCTL get device info | Returns device information word in DX for handle BX. Bit 7 set = character device. Bit 7 clear = file (bits 5:0 = drive number). CF=1 if invalid handle. |
 | `44h/09` | IOCTL check if block device is remote | BL=drive number (0=default, 1=A:, 2=B:, 3=C:, ...). Default drive maps to C:. Returns DX=0000h (local) and CF=0 for drive C:. CF=1 and AX=0Fh (invalid drive) for all other drives. Used by programs to probe available drives. |
+| `56h` | Rename/move file | Renames file from DS:DX (old path) to ES:DI (new path). Can move files across directories within the sandbox. CF=1 on error: AX=2 (file not found), AX=3 (path not found), AX=5 (target already exists), AX=17 (rename failed). Requires `--dos-root`. |
 | `57h` | Get file date/time | AL=0: get file modification time/date for handle BX. Returns CX=packed time, DX=packed date. CF=1 on error. |
 | `4Ch` | Exit with return code | Halts emulation. `exitCode` = AL. |
 
@@ -1059,11 +1078,13 @@ When `--dos-root` is used and file operations occur, the JSON output includes a 
   "bytesRead": 256,
   "bytesWritten": 64,
   "dirSearches": 1,
+  "filesDeleted": 0,
+  "filesRenamed": 0,
   "errors": 0
 }
 ```
 
-Use `fileIO.errors` to check if any operations failed. Use `bytesRead`/`bytesWritten` to verify data transfer amounts. `dirSearches` counts FindFirst calls.
+Use `fileIO.errors` to check if any operations failed. Use `bytesRead`/`bytesWritten` to verify data transfer amounts. `dirSearches` counts FindFirst calls. `filesDeleted`/`filesRenamed` track delete (AH=41h) and rename (AH=56h) operations.
 
 ### INT 33h — Mouse Services
 
@@ -1119,7 +1140,7 @@ agent86 --run-source app.asm --events @events.json
 | Key | Value | Effect |
 |-----|-------|--------|
 | `mouse` | `[x, y, buttons]` | Set mouse position and button state. Auto-enables the mouse driver. |
-| `keys` | `"string"` | Inject bytes into the keyboard buffer. Supports `\xHH`, `\n`, `\r`, `\t`, `\0`, `\\`, and `\S` (shift prefix) escapes. |
+| `keys` | `"string"` | Inject bytes into the keyboard buffer. Supports `\xHH`, `\n`, `\r`, `\t`, `\0`, `\\`, `\S` (shift), `\C` (ctrl), `\A` (alt) escapes. Modifier prefixes are stackable. |
 | `snapshot` | `true` | Capture a CPU/memory snapshot (appears in the `snapshots` array). |
 
 **Semantics:**
@@ -1618,7 +1639,7 @@ agent86 --run-source menu.asm --events '[
 
 ### Debugging File I/O Programs
 
-For programs that use INT 21h file operations (open, read, write, seek, directory listing), use `--dos-root` and inspect the `fileIO` stats:
+For programs that use INT 21h file operations (open, read, write, seek, delete, rename, directory listing), use `--dos-root` and inspect the `fileIO` stats:
 
 ```
 1.  Create a test directory with the files your program expects

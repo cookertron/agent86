@@ -46,7 +46,7 @@ Emulator flags:
   --breakpoints <a,b>   Set breakpoints at hex addresses (comma-separated).
   --watch-regs <r,r>    Watch registers for changes. Emits snapshots.
   --max-cycles <N>      Maximum CPU cycles before forced halt. Default: 1000000.
-  --input <string>      Stdin input for INT 21h/01h,06h. Escapes: \xHH \0 \n \r \t \\ \S
+  --input <string>      Stdin input for INT 21h/01h,06h. Escapes: \xHH \0 \n \r \t \\ \S \C \A
   --args <string>       Command-line tail written to PSP at offset 80h.
   --mem-dump <addr,len> Memory dump in breakpoint snapshots. Addr=hex, len=decimal.
   --output-file <path>  Write JSON to file instead of stdout.
@@ -328,12 +328,18 @@ Supported escape sequences:
   \r     carriage return (0Dh)
   \t     tab (09h)
   \\     literal backslash
-  \S     shift-held prefix (sets Left Shift flag for the next byte)
+  \S     shift prefix (sets Left Shift flag for the next byte)
+  \C     ctrl prefix (sets Ctrl flag for the next byte)
+  \A     alt prefix (sets Alt flag for the next byte)
 
 When input is exhausted, INT 21h/01h returns 0Dh (Enter).
 
-Shift prefix:
+Modifier prefixes:
+  Prefixes are stackable — multiple can precede a single byte.
   \SA          delivers 'A' with Left Shift held
+  \Ca          delivers 'a' with Ctrl held
+  \Aa          delivers 'a' with Alt held
+  \C\Sa        delivers 'a' with Ctrl+Shift held
   \S\x00\S\x4B  delivers extended key pair 00h,4Bh with shift held
 
 @@EXAMPLES
@@ -512,7 +518,7 @@ Action types (combinable per event):
   keys       "string"          Inject bytes into keyboard buffer.
   snapshot   true              Capture CPU/memory snapshot.
 
-Keys support escapes: \xHH \n \r \t \0 \\ \S (shift prefix)
+Keys support escapes: \xHH \n \r \t \0 \\ \S (shift) \C (ctrl) \A (alt)
 
 JSON output includes events object: total, fired, pending, log[].
 
@@ -622,7 +628,7 @@ agent86 --run-source life.asm --viewport 0,0,40,25 --attrs --breakpoints 0150
 Combined reference for all user interaction features.
 
 Keyboard input: --input <string>
-  Consumed by INT 21h/01h and 06h. Supports \xHH \0 \n \r \t \\ \S escapes.
+  Consumed by INT 21h/01h and 06h. Supports \xHH \0 \n \r \t \\ \S \C \A escapes.
 
 Command-line args: --args <string>
   Written to PSP at 80h (length) and 81h+ (content with leading space + CR).
@@ -672,8 +678,10 @@ File operations (require --dos-root):
   AH=3Eh  Close file            BX=handle
   AH=3Fh  Read file             BX=handle, CX=count, DS:DX=buf -> AX=read
   AH=40h  Write file            BX=handle, CX=count, DS:DX=buf -> AX=written
+  AH=41h  Delete file           DS:DX=path  (cannot delete directories)
   AH=42h  Seek                  BX=handle, AL=origin, CX:DX=offset -> DX:AX=pos
   AH=43h  Get/set attributes    AL=0:get, AL=1:set
+  AH=56h  Rename/move file      DS:DX=old path, ES:DI=new path
   AH=57h  Get file date/time    AL=0, BX=handle -> CX=time, DX=date
 
 Directory operations (require --dos-root):
@@ -684,7 +692,7 @@ Directory operations (require --dos-root):
 
 Error convention: CF=1 on failure, AX=error code.
   1=invalid function, 2=file not found, 3=path not found,
-  5=access denied, 6=invalid handle, 18=no more files
+  5=access denied, 6=invalid handle, 17=rename failed, 18=no more files
 
 DTA layout (43 bytes, set with AH=1Ah, default at PSP:0080h):
   00h  21 bytes  Reserved (search state)
@@ -1022,14 +1030,18 @@ MOV AH, 0Eh / MOV AL, 'A' / INT 10h
 Shift flags byte (AL):
   Bit 0: Right Shift held
   Bit 1: Left Shift held
-  Bit 2: Ctrl held (not yet emulated)
-  Bit 3: Alt held (not yet emulated)
+  Bit 2: Ctrl held
+  Bit 3: Alt held
   Bit 4-7: Lock states (not emulated)
 
-Shift state is driven by \S prefix in --input or event keys strings.
-  \SA          delivers 'A' with Left Shift (bit 1) set
+Modifier state is driven by prefix escapes in --input or event keys strings:
+  \S  Left Shift (bit 1)     \C  Ctrl (bit 2)     \A  Alt (bit 3)
+Prefixes are stackable: \C\Sa delivers 'a' with Ctrl+Shift (bits 1+2).
+  \SA          delivers 'A' with Left Shift set
+  \Ca          delivers 'a' with Ctrl set
+  \A\C\Sa      delivers 'a' with Alt+Ctrl+Shift set
   \S\x00\S\x4B  extended key with shift held for both bytes
-  Unshifted keys clear the shift flags.
+  Unmodified keys clear all modifier flags.
 
 @@EXAMPLES
 MOV AH, 02h / INT 16h / AND AL, 03h / JNZ shifted
@@ -1093,10 +1105,12 @@ File handle I/O (handles 5+ require --dos-root):
   AH=3Eh  Close file             BX=handle
   AH=3Fh  Read                   BX=handle, CX=count, DS:DX=buf -> AX=bytes
   AH=40h  Write                  BX=handle, CX=count, DS:DX=buf -> AX=bytes
+  AH=41h  Delete file            DS:DX=path (files only, not directories)
   AH=42h  Seek                   BX=handle, AL=origin(0/1/2), CX:DX=offset -> DX:AX
   AH=43h  Get/set attrs          AL=0:get->CX, AL=1:set(stub)
   AH=44h/00 IOCTL get info       BX=handle -> DX=info word
   AH=44h/09 IOCTL block remote   BL=drive -> DX=0(local) for C:
+  AH=56h  Rename/move file       DS:DX=old path, ES:DI=new path
   AH=57h  Get file date/time     AL=0, BX=handle -> CX=time, DX=date
   AH=4Ch  Exit with code         AL=exit code
 

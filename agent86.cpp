@@ -12,6 +12,8 @@
 #include <set>
 #include <filesystem>
 
+#define AGENT86_VERSION "0.9.1"
+
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
@@ -1172,10 +1174,16 @@ void assembleLine(AssemblerContext& ctx, const vector<Token>& tokens, int lineNu
             int valIdx = 2; // Value starts at index 2
             int val = parseExpression(ctx, tokens, valIdx, 0);
 
-            // Allow redefinition? Usually yes for EQU or no for CONST. EQU is constant per assembly,
-            // but = directive allows change. MASM EQU is constant.
-            // We'll just overwrite/set.
-            ctx.symbolTable[label] = { val, true, tokens[0].line };
+            if (ctx.symbolTable.count(label) && !ctx.symbolTable[label].isConstant
+                && ctx.symbolTable[label].definedLine != tokens[0].line) {
+                int prevLine = ctx.symbolTable[label].definedLine;
+                logError(ctx, tokens[0].line,
+                    "EQU '" + label + "' conflicts with existing label defined at line " + to_string(prevLine),
+                    "A symbol can only be defined once. Rename the EQU or the label to avoid this collision.");
+            }
+            if (ctx.isPass1) {
+                ctx.symbolTable[label] = { val, true, tokens[0].line };
+            }
 
             // Debug output if needed
             // if (ctx.isPass1) cout << "EQU: " << label << " = " << val << endl;
@@ -1312,14 +1320,19 @@ void assembleLine(AssemblerContext& ctx, const vector<Token>& tokens, int lineNu
         }
 
         label = toUpper(label);
-        if (ctx.isPass1) {
-            if (ctx.symbolTable.count(label) && !ctx.symbolTable[label].isConstant
-                && ctx.symbolTable[label].definedLine != tokens[0].line) {
-                int prevLine = ctx.symbolTable[label].definedLine;
+        if (ctx.symbolTable.count(label) && ctx.symbolTable[label].definedLine != tokens[0].line) {
+            int prevLine = ctx.symbolTable[label].definedLine;
+            if (ctx.symbolTable[label].isConstant) {
+                logError(ctx, tokens[0].line,
+                    "Label '" + label + "' conflicts with EQU constant defined at line " + to_string(prevLine),
+                    "A symbol can only be defined once. Rename the label or the EQU to avoid this collision.");
+            } else {
                 logWarning(ctx, tokens[0].line,
                     "Label '" + label + "' redefined (previous definition at line " + to_string(prevLine) + ")",
                     "Each label should be defined once. If you need the same name in different scopes, use local labels with '.' prefix inside PROC/ENDP blocks.");
             }
+        }
+        if (ctx.isPass1) {
             ctx.symbolTable[label] = { ctx.currentAddress, false, tokens[0].line };
         }
         idx++;
@@ -3557,6 +3570,8 @@ struct DOSFileState {
     int bytesRead = 0;
     int bytesWritten = 0;
     int dirSearches = 0;
+    int filesDeleted = 0;
+    int filesRenamed = 0;
     int errors = 0;
 };
 
@@ -3749,9 +3764,12 @@ static string readDosString(const Memory& mem, uint16_t seg, uint16_t off) {
     return s;
 }
 
-// Sentinel byte in stdinSource: the next byte has Shift held.
-// Used by \S escape in --input and consumed transparently by IOCapture::readChar().
-static const uint8_t SHIFT_PREFIX = 0xFE;
+// Sentinel bytes in stdinSource: modifier flags for the next character.
+// Used by \S \C \A escapes in --input and consumed transparently by IOCapture::readChar().
+// Multiple prefixes can be stacked (e.g. \C\S before a key = Ctrl+Shift).
+static const uint8_t SHIFT_PREFIX = 0xFE; // bit 1: Left Shift
+static const uint8_t CTRL_PREFIX  = 0xFD; // bit 2: Ctrl
+static const uint8_t ALT_PREFIX   = 0xFC; // bit 3: Alt
 
 // Decode C-style escape sequences in --input strings so that binary bytes
 // (including 0x00 for extended-key prefixes) can be specified on the command line.
@@ -3765,6 +3783,12 @@ static string unescapeInput(const char* raw) {
             char next = *(p+1);
             if (next == 'S') {
                 out += (char)SHIFT_PREFIX;
+                p += 2;
+            } else if (next == 'C') {
+                out += (char)CTRL_PREFIX;
+                p += 2;
+            } else if (next == 'A') {
+                out += (char)ALT_PREFIX;
                 p += 2;
             } else if (next == 'x' && isxdigit((unsigned char)*(p+2)) && isxdigit((unsigned char)*(p+3))) {
                 // \xHH
@@ -3926,17 +3950,20 @@ struct IOCapture {
     string stdoutBuf;
     string stdinSource;
     size_t stdinPos = 0;
-    uint8_t shiftFlags = 0; // INT 16h/02h shift-flags byte (bit 0=RShift, bit 1=LShift)
+    uint8_t shiftFlags = 0; // INT 16h/02h shift-flags byte (bit0=RShift, bit1=LShift, bit2=Ctrl, bit3=Alt)
     int exitCode = 0;
     int readChar() {
         if (stdinPos >= stdinSource.size()) return -1;
-        if ((unsigned char)stdinSource[stdinPos] == SHIFT_PREFIX) {
-            shiftFlags = 0x02; // Left Shift held
-            stdinPos++;
-            if (stdinPos >= stdinSource.size()) return -1;
-        } else {
-            shiftFlags = 0x00;
+        // Accumulate modifier prefixes (stackable: \C\S = Ctrl+Shift)
+        shiftFlags = 0x00;
+        while (stdinPos < stdinSource.size()) {
+            uint8_t b = (unsigned char)stdinSource[stdinPos];
+            if      (b == SHIFT_PREFIX) { shiftFlags |= 0x02; stdinPos++; }
+            else if (b == CTRL_PREFIX)  { shiftFlags |= 0x04; stdinPos++; }
+            else if (b == ALT_PREFIX)   { shiftFlags |= 0x08; stdinPos++; }
+            else break;
         }
+        if (stdinPos >= stdinSource.size()) return -1;
         return (unsigned char)stdinSource[stdinPos++];
     }
 };
@@ -4037,6 +4064,8 @@ struct EmulatorResult {
         int bytesRead = 0;
         int bytesWritten = 0;
         int dirSearches = 0;
+        int filesDeleted = 0;
+        int filesRenamed = 0;
         int errors = 0;
     };
     FileIOStats fileIO;
@@ -4730,6 +4759,48 @@ void handleInt21(CPU& cpu, Memory& mem, IOCapture& io, EmulatorResult& result, V
             }
             break;
         }
+        case 0x41: { // Delete file
+            if (!dosFs.enabled) {
+                cpu.setFlag(CPU::CF, true);
+                cpu.regs[0] = 2; // file not found (no filesystem)
+                dosFs.errors++;
+                break;
+            }
+            {
+                string dosPath = readDosString(mem, cpu.sregs[3], cpu.regs[2]); // DS:DX = path
+                bool pathError = false;
+                string hostPath = resolveDosPath(dosFs, dosPath, pathError);
+                if (pathError) {
+                    cpu.setFlag(CPU::CF, true);
+                    cpu.regs[0] = 3; // path not found
+                    dosFs.errors++;
+                    break;
+                }
+                namespace fs = std::filesystem;
+                std::error_code ec;
+                if (!fs::exists(hostPath, ec)) {
+                    cpu.setFlag(CPU::CF, true);
+                    cpu.regs[0] = 2; // file not found
+                    dosFs.errors++;
+                    break;
+                }
+                if (fs::is_directory(hostPath, ec)) {
+                    cpu.setFlag(CPU::CF, true);
+                    cpu.regs[0] = 5; // access denied (can't delete directories with 0x41)
+                    dosFs.errors++;
+                    break;
+                }
+                if (!fs::remove(hostPath, ec)) {
+                    cpu.setFlag(CPU::CF, true);
+                    cpu.regs[0] = 5; // access denied
+                    dosFs.errors++;
+                    break;
+                }
+                dosFs.filesDeleted++;
+                cpu.setFlag(CPU::CF, false);
+            }
+            break;
+        }
         case 0x42: { // Seek (lseek)
             {
                 int handle = (int)cpu.regs[3]; // BX
@@ -5045,6 +5116,57 @@ void handleInt21(CPU& cpu, Memory& mem, IOCapture& io, EmulatorResult& result, V
                     mem.swrite8(dtaSeg, (uint16_t)(dtaOff + 0x1E + i), (uint8_t)dosName[i]);
                 }
 
+                cpu.setFlag(CPU::CF, false);
+            }
+            break;
+        }
+        case 0x56: { // Rename/move file
+            if (!dosFs.enabled) {
+                cpu.setFlag(CPU::CF, true);
+                cpu.regs[0] = 2; // file not found (no filesystem)
+                dosFs.errors++;
+                break;
+            }
+            {
+                string oldDosPath = readDosString(mem, cpu.sregs[3], cpu.regs[2]); // DS:DX = old name
+                string newDosPath = readDosString(mem, cpu.sregs[0], cpu.regs[7]); // ES:DI = new name
+                bool pathError = false;
+                string oldHostPath = resolveDosPath(dosFs, oldDosPath, pathError);
+                if (pathError) {
+                    cpu.setFlag(CPU::CF, true);
+                    cpu.regs[0] = 3; // path not found
+                    dosFs.errors++;
+                    break;
+                }
+                string newHostPath = resolveDosPath(dosFs, newDosPath, pathError);
+                if (pathError) {
+                    cpu.setFlag(CPU::CF, true);
+                    cpu.regs[0] = 3; // path not found
+                    dosFs.errors++;
+                    break;
+                }
+                namespace fs = std::filesystem;
+                std::error_code ec;
+                if (!fs::exists(oldHostPath, ec)) {
+                    cpu.setFlag(CPU::CF, true);
+                    cpu.regs[0] = 2; // file not found
+                    dosFs.errors++;
+                    break;
+                }
+                if (fs::exists(newHostPath, ec)) {
+                    cpu.setFlag(CPU::CF, true);
+                    cpu.regs[0] = 5; // access denied (target already exists)
+                    dosFs.errors++;
+                    break;
+                }
+                fs::rename(oldHostPath, newHostPath, ec);
+                if (ec) {
+                    cpu.setFlag(CPU::CF, true);
+                    cpu.regs[0] = 17; // not same device (or general rename failure)
+                    dosFs.errors++;
+                    break;
+                }
+                dosFs.filesRenamed++;
                 cpu.setFlag(CPU::CF, false);
             }
             break;
@@ -6129,6 +6251,8 @@ EmulatorResult runEmulator(const vector<uint8_t>& binary, const EmulatorConfig& 
     result.fileIO.bytesRead = dosFs.bytesRead;
     result.fileIO.bytesWritten = dosFs.bytesWritten;
     result.fileIO.dirSearches = dosFs.dirSearches;
+    result.fileIO.filesDeleted = dosFs.filesDeleted;
+    result.fileIO.filesRenamed = dosFs.filesRenamed;
     result.fileIO.errors = dosFs.errors;
 
     cpuOut = cpu;
@@ -6286,7 +6410,7 @@ void emitEmulatorJSON(const EmulatorResult& result, const CPU& cpu) {
     }
 
     // File I/O stats (conditional)
-    if (result.fileIO.filesOpened > 0 || result.fileIO.dirSearches > 0) {
+    if (result.fileIO.filesOpened > 0 || result.fileIO.dirSearches > 0 || result.fileIO.filesDeleted > 0 || result.fileIO.filesRenamed > 0) {
         cout << "," << endl;
         cout << "  \"fileIO\": {" << endl;
         cout << "    \"filesOpened\": " << result.fileIO.filesOpened << "," << endl;
@@ -6294,6 +6418,8 @@ void emitEmulatorJSON(const EmulatorResult& result, const CPU& cpu) {
         cout << "    \"bytesRead\": " << result.fileIO.bytesRead << "," << endl;
         cout << "    \"bytesWritten\": " << result.fileIO.bytesWritten << "," << endl;
         cout << "    \"dirSearches\": " << result.fileIO.dirSearches << "," << endl;
+        cout << "    \"filesDeleted\": " << result.fileIO.filesDeleted << "," << endl;
+        cout << "    \"filesRenamed\": " << result.fileIO.filesRenamed << "," << endl;
         cout << "    \"errors\": " << result.fileIO.errors << endl;
         cout << "  }";
     }
@@ -6421,7 +6547,7 @@ void emitCombinedJSON(AssemblerContext& asmCtx, const EmulatorResult& emuResult,
     }
 
     // File I/O stats (conditional)
-    if (emuResult.fileIO.filesOpened > 0 || emuResult.fileIO.dirSearches > 0) {
+    if (emuResult.fileIO.filesOpened > 0 || emuResult.fileIO.dirSearches > 0 || emuResult.fileIO.filesDeleted > 0 || emuResult.fileIO.filesRenamed > 0) {
         cout << "," << endl;
         cout << "    \"fileIO\": {" << endl;
         cout << "      \"filesOpened\": " << emuResult.fileIO.filesOpened << "," << endl;
@@ -6429,6 +6555,8 @@ void emitCombinedJSON(AssemblerContext& asmCtx, const EmulatorResult& emuResult,
         cout << "      \"bytesRead\": " << emuResult.fileIO.bytesRead << "," << endl;
         cout << "      \"bytesWritten\": " << emuResult.fileIO.bytesWritten << "," << endl;
         cout << "      \"dirSearches\": " << emuResult.fileIO.dirSearches << "," << endl;
+        cout << "      \"filesDeleted\": " << emuResult.fileIO.filesDeleted << "," << endl;
+        cout << "      \"filesRenamed\": " << emuResult.fileIO.filesRenamed << "," << endl;
         cout << "      \"errors\": " << emuResult.fileIO.errors << endl;
         cout << "    }";
     }
@@ -7676,7 +7804,10 @@ int main(int argc, char* argv[]) {
     // Arg parsing
     for(int i=1; i<argc; ++i) {
         string arg = argv[i];
-        if(arg == "--help" || arg == "-h") {
+        if(arg == "--version" || arg == "-v") {
+            cout << "{\"tool\":\"agent86\",\"version\":\"" << AGENT86_VERSION << "\"}" << endl;
+            return 0;
+        } else if(arg == "--help" || arg == "-h") {
             namespace fs = std::filesystem;
             fs::path helpPath = fs::path(argv[0]).parent_path() / "agent86.hlp";
             vector<HelpEntry> helpEntries = loadHelp(helpPath.string());
@@ -7930,6 +8061,7 @@ int main(int argc, char* argv[]) {
         // Iteration 1+: detect out-of-range Jcc and mark for promotion; repeat until stable
         for (int pass1Iter = 0; pass1Iter < 20; ++pass1Iter) {
             size_t prevPromotions = ctx.promotedJumps.size();
+            int prevEndAddress = ctx.currentAddress; // track total code size
             ctx.isPass1 = true; ctx.currentAddress = 0;
             // Don't clear symbolTable — forward refs need previous iteration's values
             ctx.currentProcedureName = "";
@@ -7944,8 +8076,9 @@ int main(int argc, char* argv[]) {
             if (!ctx.detectPromotions) {
                 // First iteration done — enable detection and always run at least one more
                 ctx.detectPromotions = true;
-            } else if (ctx.promotedJumps.size() == prevPromotions) {
-                break; // stable — no new promotions
+            } else if (ctx.promotedJumps.size() == prevPromotions
+                       && ctx.currentAddress == prevEndAddress) {
+                break; // stable — no new promotions and no address changes
             }
         }
         // Pass 2
@@ -8031,6 +8164,7 @@ int main(int argc, char* argv[]) {
     // Iteration 1+: detect out-of-range Jcc and mark for promotion; repeat until stable
     for (int pass1Iter = 0; pass1Iter < 20; ++pass1Iter) {
         size_t prevPromotions = ctx.promotedJumps.size();
+        int prevEndAddress = ctx.currentAddress; // track total code size
         ctx.isPass1 = true;
         ctx.currentAddress = 0;
         // Don't clear symbolTable — forward refs need previous iteration's values
@@ -8046,8 +8180,9 @@ int main(int argc, char* argv[]) {
         if (!ctx.detectPromotions) {
             // First iteration done — enable detection and always run at least one more
             ctx.detectPromotions = true;
-        } else if (ctx.promotedJumps.size() == prevPromotions) {
-            break; // stable — no new promotions
+        } else if (ctx.promotedJumps.size() == prevPromotions
+                   && ctx.currentAddress == prevEndAddress) {
+            break; // stable — no new promotions and no address changes
         }
     }
 

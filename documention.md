@@ -97,7 +97,7 @@ agent86 --run hello.com
 | `--breakpoints <addr1,addr2,...>` | Set breakpoints at hex addresses (comma-separated). | None |
 | `--watch-regs <reg1,reg2,...>` | Watch registers for changes. Emits snapshots when watched registers change. | None |
 | `--max-cycles <N>` | Maximum CPU cycles before forced halt. | 1000000 |
-| `--input <string>` | Provide stdin input for the program (consumed by INT 21h/01h and 06h). | Empty |
+| `--input <string>` | Provide stdin input for the program (consumed by INT 21h/01h and 06h). Supports escapes: `\xHH`, `\0`, `\n`, `\r`, `\t`, `\\`, `\S` (shift), `\C` (ctrl), `\A` (alt). Modifier prefixes are stackable. | Empty |
 | `--mem-dump <addr,len>` | Include memory dump in breakpoint snapshots. Address in hex, length in decimal. | None |
 | `--screen` | **Capture full 80×50 screen** from VRAM into JSON output. | Off |
 | `--viewport <col,row,w,h>` | **Capture a rectangular region** of the screen. Implies `--screen` behavior but only for the specified window. | Off |
@@ -919,7 +919,7 @@ agent86 --run-source app.asm --events @events.json
 | Key | Value | Effect |
 |-----|-------|--------|
 | `mouse` | `[x, y, buttons]` | Set mouse position and button state. Auto-enables the mouse driver. |
-| `keys` | `"string"` | Inject bytes into the keyboard buffer. Supports `\xHH`, `\n`, `\r`, `\t`, `\0`, `\\` escapes. |
+| `keys` | `"string"` | Inject bytes into the keyboard buffer. Supports `\xHH`, `\n`, `\r`, `\t`, `\0`, `\\`, `\S` (shift), `\C` (ctrl), `\A` (alt) escapes. Modifier prefixes are stackable. |
 | `snapshot` | `true` | Capture a CPU/memory snapshot (appears in the `snapshots` array). |
 
 **Semantics:**
