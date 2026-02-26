@@ -1736,3 +1736,4 @@ For advanced debugging, here is how the assembler encodes operands in the `decod
 | `MEM(BYTE [100])` | Memory, byte-sized, direct address | `MOV MEM(BYTE [100]), IMM(5)` |
 | `MEM(WORD [BX+SI+8])` | Memory with base+index+disp | `LEA REG(DI), MEM(WORD [BX+SI+8])` |
 | `MEM(WORD SEG:[BX])` | Memory with segment override | Segment prefix byte emitted before opcode |
+
