@@ -6,6 +6,9 @@
 *.pdb
 *.ilk
 
+# Assembly source files
+*.asm
+
 # Temp/scratch files
 stderr.txt
 stdout.txt

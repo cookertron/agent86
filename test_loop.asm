@@ -1,7 +1,0 @@
-ORG 100h
-XOR AX, AX
-MOV CX, 10
-.loop:
-ADD AX, CX
-LOOP .loop
-INT 20h
