@@ -1182,12 +1182,12 @@ Alt+F then Alt+Q (open File menu, then Quit):
 
 F10 key (via unicode escape):
 ```json
-[{"keys":"\\u0000\\u0044"}]
+[{"keys":"\u0000\u0044"}]
 ```
 
 Arrow key sequence (Down, Down, Enter):
 ```json
-[{"keys":"\\u0000\\u0050\\u0000\\u0050\\r"}]
+[{"keys":"\u0000\u0050\u0000\u0050\r"}]
 ```
 
 Mouse click then release (separate events):
