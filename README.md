@@ -116,30 +116,31 @@ src/
     kbd.cpp / .h      Keyboard buffer and input event processing
 ```
 
-## Building on Linux
+## Building
 
-The source code is cross-platform (Windows and Linux). On Linux, it requires:
+Requires:
 
-- **g++** (13+) or **clang++** with C++17 support
-- **x86-64 architecture** (the JIT emits native x64 machine code)
+- **Linux x86-64** (the JIT emits native x64 machine code)
+- **g++** or **clang++** with C++17 support
 - No external libraries or dependencies
 
 ### Compile
 
 ```bash
-g++ -std=c++17 -O2 -o agent86 \
+g++ -std=c++17 -O2 -static -o agent86 \
   src/main.cpp src/asm.cpp src/lexer.cpp src/encoder.cpp \
   src/expr.cpp src/symtab.cpp src/jit/jit.cpp src/jit/emitter.cpp \
   src/jit/dos.cpp src/jit/decoder.cpp src/jit/kbd.cpp
 ```
 
-This produces a single `agent86` binary with no runtime dependencies beyond libc and libstdc++.
+This produces a single statically-linked `agent86` binary with no runtime dependencies.
 
-### Platform Notes
+### Notes
 
-- The JIT code buffer uses `mmap` with `PROT_EXEC` on Linux (vs `VirtualAlloc` on Windows)
-- DOS `FindFirst`/`FindNext` (INT 21h AH=4Eh/4Fh) are stubbed on Linux (return "no more files") — all other file I/O works via standard POSIX APIs
-- Path handling uses `realpath` on Linux (vs `_fullpath` on Windows)
+- The JIT code buffer uses `mmap` with `PROT_EXEC`
+- All file I/O uses standard POSIX APIs
+- FindFirst/FindNext (INT 21h AH=4Eh/4Fh) uses POSIX `glob()`
+- Path handling uses `realpath`
 
 ## Limitations
 
