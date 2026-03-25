@@ -4,6 +4,41 @@ All notable changes to agent86 are documented in this file.
 
 ---
 
+## [0.20.0] - 2026-03-19
+
+### Added
+- **DOS_FAIL / DOS_PARTIAL debug directives** — inject one-shot DOS failures for testing error-handling code paths. `DOS_FAIL <int>, <ah> [, <error_code>]` arms a failure that sets CF=1 and AX=error_code (default 5) on the next matching INT call. `DOS_PARTIAL <int>, <ah>, <count>` arms a partial result that sets CF=0 and AX=count. Both are one-shot: subsequent calls proceed normally. Works with any INT/AH combination (file create 3Ch, write 40h, alloc 48h, etc.). Full pipeline: assembler parses directive, .dbg serialization, JIT loads and arms at address, intercepts before handleDOSInt.
+
+### Test Results
+- tests/test_dos_fail.asm: 6 tests pass (default error, custom error, one-shot, write fail, partial write, alloc fail)
+- All regressions pass: test_log, test_regs, test_vramout, test_segov, test_ds_io, test_hello25, test_push_pop_es, test_jit_memcorrupt
+
+---
+
+## [0.19.5] - 2026-03-18
+
+### Fixed
+- **Debug directives collide with jump targets** — Debug directives (LOG, BREAKPOINT, ASSERT_EQ, etc.) emit 0 bytes of machine code. When placed between a conditional jump's fall-through path and the jump target label, they shared the same address as the target. The JIT fires all directives at a given address, so a BREAKPOINT intended for the fall-through path would also fire when the jump was taken. Fixed by tracking `directive_pending_` state in the assembler: when a runtime debug directive is followed by a label, a 1-byte NOP (0x90) is automatically inserted to separate their addresses. Both pass 1 and pass 2 agree on NOP placement, so all forward references remain correct. The NOP is unreachable on the fall-through path (BREAKPOINT halts before it) and invisible on the jump path (jump targets now resolve to the post-NOP address).
+
+### Test Results
+- Bug reproducer passes: JC jumps over LOG+BREAKPOINT on fall-through path, only jump-target LOG fires
+- All regressions pass: test_log, test_regs, test_vramout, test_segov, test_ds_io, test_hello25, test_push_pop_es, test_segs, test_jit_memcorrupt, test_offset, test_macro
+
+---
+
+## [0.19.4] - 2026-03-16
+
+### Fixed
+- **ASSERT_EQ / LOG do not support segment override syntax** — `ASSERT_EQ BYTE ES:[0], 41h` and `LOG "msg", BYTE ES:[addr]` now parse and honor segment override prefixes (ES, CS, SS, DS). Previously the parser expected `[` immediately after the BYTE/WORD size specifier, rejecting the segment register prefix. The fix spans the full pipeline: assembler parser detects `SREG:` tokens and records `mem_seg` in the directive, all three .dbg serialization paths emit `"mem_seg":N`, the JIT deserializer reads it back, and the runtime computes the physical address as `sregs[seg]*16 + offset` (20-bit, matching the emulator's segmented addressing). Failure messages now include the segment name (e.g., `BYTE ES:[0] == 65`).
+
+### Test Results
+- Bug reproducer passes: `ASSERT_EQ BYTE ES:[0], 41h` compiles and verifies at runtime
+- Comprehensive: ES byte/word, SS byte, default-segment byte, all pass
+- LOG with segment override: `LOG "msg", BYTE ES:[0]` reports correct value from ES segment
+- All regressions pass: test_segov, test_macro, test_log
+
+---
+
 ## [0.19.3] - 2026-03-11
 
 ### Fixed
@@ -61,7 +96,7 @@ Alt+Q via modifier toggle (recommended for Alt+letter shortcuts):
 
 F10 via unicode escape (for extended keys without modifier toggles):
 ```json
-[{"keys":"\\u0000\\u0044"}]
+[{"keys":"\u0000\u0044"}]
 ```
 - INT 16h AH=00h → AX=0x4400 (scancode=0x44, ascii=0x00)
 - INT 21h AH=06h → first call: AL=0x00, second call: AL=0x44
