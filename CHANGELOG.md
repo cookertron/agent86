@@ -4,6 +4,36 @@ All notable changes to agent86 are documented in this file.
 
 ---
 
+## [0.21.0] - 2026-03-30
+
+### Added
+- **SECTION .bss — true BSS support** — New `SECTION .bss` directive switches the assembler into BSS mode: the location counter continues advancing and labels are assigned addresses as usual, but no bytes are emitted to the .COM output. `RESB`/`RESW` in BSS reserve space without inflating the binary. `DB`/`DW` and instructions in BSS produce assembly errors. Compile-time directives (ASSERT, PRINT, EQU) remain allowed; runtime directives (BREAKPOINT, LOG, etc.) are blocked. Compile JSON now includes `"bss_start"` and `"bss_end"` fields when a BSS section exists. Segment overflow is checked (`bss_end <= 0xFFFF`). Fully backward compatible — existing programs without `SECTION .bss` are unaffected.
+
+### Test Results
+- tests/test_bss.asm: runtime correctness (BSS memory reads zero, write/read round-trip), label resolution past file end, EQU/ASSERT/PRINT in BSS, pre-BSS RESB still emits zeros, JSON `"size"` = code+data only (79 bytes, not 4081)
+- tests/test_bss_err_db.asm: DB in BSS → "initialized data (DB) not allowed in BSS section"
+- tests/test_bss_err_instr.asm: NOP in BSS → "instructions not allowed in BSS section"
+- tests/test_bss_err_overflow.asm: RESB 65535 → "BSS exceeds 64KB segment limit"
+- tests/test_bss_include.asm: INCLUDE after SECTION .bss inherits BSS mode, file size = 1 byte
+- All regressions pass: test_dos_fail, test_log, test_macro, test_segov, test_regs, test_ds_io
+
+---
+
+## [0.20.1] - 2026-03-26
+
+### Added
+- **INT 10h AH=12h BL=10h — EGA/VGA detection** — Returns standard EGA/VGA configuration: BH=00h (color mode), BL=03h (256KB video memory), CH=00h (feature connector), CL=09h (switch settings). Used by DOS programs to detect video adapter capabilities.
+
+### Fixed
+- **`\A` modifier now converts digits to Alt+digit scan codes** — Previously `\A` only set ascii=0x00 for letters (a-z/A-Z). Digits (0-9) were passed through with their normal ASCII value, requiring `\u0000\u00XX` workarounds. Now `\A1` correctly produces scancode=0x02, ascii=0x00 (same pattern as Alt+letter).
+
+### Test Results
+- tests/test_int10h_12.asm: 2 assertions pass (BX=0003h, CX=0009h)
+- tests/test_alt_digit.asm: 4 assertions pass (Alt+1, Alt+5, Alt+0, plain '7')
+- All regressions pass: test_hello25, test_vramout, test_log, test_segov, test_int10h_12
+
+---
+
 ## [0.20.0] - 2026-03-19
 
 ### Added
