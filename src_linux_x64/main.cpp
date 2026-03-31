@@ -777,6 +777,24 @@ DATA DIRECTIVES
   RESW count              Reserve count zero words
   EQU                     Named constant:  MAX EQU 100
 
+  SECTION .bss            Switch to BSS (uninitialized data) section.
+    After this directive, RESB/RESW advance the location counter but
+    emit no bytes to the .COM file. Labels are assigned addresses as
+    usual. DB/DW and instructions are errors in BSS. Must be the final
+    section -- once entered, persists until end of file.
+
+      ORG 100h
+          JMP main
+      msg: DB 'Hello$'
+      main:
+          MOV DX, msg
+          HLT
+      SECTION .bss
+      buffer:  RESB 4000     ; 0 bytes in file, valid at runtime
+      counter: RESW 1
+
+    JSON: {"compiled":"OK","size":N,"bss_start":N,"bss_end":N,...}
+
 LABELS
   Global:   main:          Defines address, sets scope for local labels
   Local:    .loop:         Dot-prefixed, scoped to the preceding global label
@@ -1390,7 +1408,12 @@ int main(int argc, char* argv[]) {
         }
 
         // Emit compile JSON
-        std::cout << "{\"compiled\":\"OK\",\"size\":" << asmOutput.size() << ",\"symbols\":{";
+        std::cout << "{\"compiled\":\"OK\",\"size\":" << asmOutput.size();
+        if (assembler.bssStart() >= 0) {
+            std::cout << ",\"bss_start\":" << assembler.bssStart()
+                      << ",\"bss_end\":" << assembler.bssEnd();
+        }
+        std::cout << ",\"symbols\":{";
         auto syms = assembler.symbols().dump();
         bool first = true;
         for (auto& kv : syms) {
@@ -1642,7 +1665,12 @@ int main(int argc, char* argv[]) {
     }
 
     // Success: emit structured JSON with size and symbols
-    std::cout << "{\"compiled\":\"OK\",\"size\":" << output.size() << ",\"symbols\":{";
+    std::cout << "{\"compiled\":\"OK\",\"size\":" << output.size();
+    if (assembler.bssStart() >= 0) {
+        std::cout << ",\"bss_start\":" << assembler.bssStart()
+                  << ",\"bss_end\":" << assembler.bssEnd();
+    }
+    std::cout << ",\"symbols\":{";
     auto syms = assembler.symbols().dump();
     bool first = true;
     for (auto& kv : syms) {

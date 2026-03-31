@@ -51,6 +51,7 @@ bool Lexer::isMnemonic(const std::string& name) {
 bool Lexer::isDirective(const std::string& name) {
     static const char* dirs[] = {
         "DB","DW","RESB","RESW","EQU","ORG","PROC","ENDP","INCLUDE",
+        "SECTION",
         "TRACE_START","TRACE_STOP","BREAKPOINT",
         "ASSERT","HEX_START","HEX_END","PRINT","ASSERT_EQ","SCREEN","VRAMOUT","REGS",
         "LOG","LOG_ONCE","DOS_FAIL","DOS_PARTIAL",

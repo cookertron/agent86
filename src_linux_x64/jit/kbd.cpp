@@ -62,8 +62,8 @@ void KeyboardBuffer::injectKeys(const std::string& keys) {
         if ((mods & 0x04) && ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z'))) {
             ascii = (uint8_t)((ch & 0x1F));  // toupper & subtract 0x40
         }
-        // Alt+letter: real BIOS returns ascii=0x00 with the letter's scan code
-        if ((mods & 0x08) && ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z'))) {
+        // Alt+key: real BIOS returns ascii=0x00 with the key's scan code
+        if ((mods & 0x08) && ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9'))) {
             ascii = 0x00;
         }
         buffer_.push_back({ascii, sc, mods});

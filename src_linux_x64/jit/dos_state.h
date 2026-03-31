@@ -12,7 +12,6 @@ struct DosState {
     uint16_t dta_addr = 0x80;   // DTA offset  (set by AH=1Ah, default=PSP+80h)
     std::string current_dir;    // no drive letter, no leading backslash
 
-    // POSIX FindFirst/FindNext state
     std::vector<std::string> find_results;
     size_t find_index = 0;
     bool find_active = false;

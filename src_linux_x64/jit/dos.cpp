@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <glob.h>
 #include <libgen.h>
+#include <climits>
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -35,18 +36,22 @@ static uint16_t packDOSDate(int year, int month, int day) {
 static void writeDTARecord(CPU8086& cpu, uint32_t dta_phys,
                            const char* filepath) {
     uint8_t* mem = cpu.memory;
-    struct stat st;
-
-    if (stat(filepath, &st) != 0) return;
 
     // Offset 0x00: 21 reserved bytes (zero)
     memset(&mem[dta_phys], 0, 21);
 
+    // stat the file to get attributes, size, and time
+    struct stat st;
+    if (stat(filepath, &st) != 0) {
+        memset(&mem[dta_phys], 0, 43);
+        return;
+    }
+
     // Offset 0x15: file attributes (1 byte)
-    uint8_t attr = 0x20; // archive
-    if (S_ISDIR(st.st_mode)) attr = 0x10;
-    if (!(st.st_mode & S_IWUSR)) attr |= 0x01; // read-only
-    mem[(dta_phys + 0x15) & 0xFFFFF] = attr;
+    uint16_t dosAttr = 0x20; // archive
+    if (S_ISDIR(st.st_mode))     dosAttr |= 0x10;
+    if (!(st.st_mode & S_IWUSR)) dosAttr |= 0x01; // read-only
+    mem[(dta_phys + 0x15) & 0xFFFFF] = (uint8_t)dosAttr;
 
     // Convert mtime to DOS date/time
     struct tm* t = localtime(&st.st_mtime);
@@ -69,12 +74,11 @@ static void writeDTARecord(CPU8086& cpu, uint32_t dta_phys,
     mem[(dta_phys + 0x1D) & 0xFFFFF] = (size >> 24) & 0xFF;
 
     // Offset 0x1E: filename (13 bytes ASCIIZ, uppercase, 8.3)
-    // Extract just the filename from the path
-    char pathcopy[256];
-    strncpy(pathcopy, filepath, sizeof(pathcopy) - 1);
-    pathcopy[sizeof(pathcopy) - 1] = '\0';
-    const char* name = basename(pathcopy);
-
+    // basename() may modify its argument, so copy first
+    char tmp[PATH_MAX];
+    strncpy(tmp, filepath, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
+    const char* name = basename(tmp);
     char upper[13];
     memset(upper, 0, 13);
     for (int i = 0; i < 12 && name[i]; i++)
@@ -483,7 +487,7 @@ bool handleDOSInt(CPU8086& cpu, int intNum, std::string& output,
                     setError(cpu, 0x02); return true;
                 }
                 uint16_t dosAttr = 0x20; // archive
-                if (S_ISDIR(st.st_mode)) dosAttr |= 0x10;
+                if (S_ISDIR(st.st_mode))     dosAttr |= 0x10;
                 if (!(st.st_mode & S_IWUSR)) dosAttr |= 0x01; // read-only
                 cpu.regs[R_CX] = dosAttr;
                 clearCF(cpu);
@@ -532,36 +536,27 @@ bool handleDOSInt(CPU8086& cpu, int intNum, std::string& output,
         case 0x4E: {
             // AH=4Eh — FindFirst (DS:DX = ASCIIZ pattern, CX = attr mask)
             std::string pattern = dos.resolvePath(cpu.memory, cpu.sregs[S_DS], cpu.regs[R_DX]);
-
-            // Reset any previous search
             dos.find_results.clear();
             dos.find_index = 0;
             dos.find_active = false;
 
-            // Use POSIX glob() to expand the pattern
             glob_t g;
             int ret = glob(pattern.c_str(), GLOB_NOSORT, nullptr, &g);
             if (ret != 0) {
                 if (ret != GLOB_NOMATCH) globfree(&g);
-                setError(cpu, 0x12); // no more files
+                setError(cpu, 0x12);
                 return true;
             }
-
-            // Collect results
             for (size_t i = 0; i < g.gl_pathc; i++) {
                 dos.find_results.push_back(g.gl_pathv[i]);
             }
             globfree(&g);
 
-            if (dos.find_results.empty()) {
-                setError(cpu, 0x12);
-                return true;
-            }
+            if (dos.find_results.empty()) { setError(cpu, 0x12); return true; }
 
             dos.find_active = true;
             dos.find_index = 0;
-            writeDTARecord(cpu, physAddr(dos.dta_seg, dos.dta_addr),
-                           dos.find_results[dos.find_index].c_str());
+            writeDTARecord(cpu, physAddr(dos.dta_seg, dos.dta_addr), dos.find_results[dos.find_index].c_str());
             dos.find_index++;
             clearCF(cpu);
             return true;
@@ -571,12 +566,10 @@ bool handleDOSInt(CPU8086& cpu, int intNum, std::string& output,
             // AH=4Fh — FindNext
             if (!dos.find_active || dos.find_index >= dos.find_results.size()) {
                 dos.find_active = false;
-                dos.find_results.clear();
                 setError(cpu, 0x12); // no more files
                 return true;
             }
-            writeDTARecord(cpu, physAddr(dos.dta_seg, dos.dta_addr),
-                           dos.find_results[dos.find_index].c_str());
+            writeDTARecord(cpu, physAddr(dos.dta_seg, dos.dta_addr), dos.find_results[dos.find_index].c_str());
             dos.find_index++;
             clearCF(cpu);
             return true;
@@ -856,6 +849,18 @@ bool handleDOSInt(CPU8086& cpu, int intNum, std::string& output,
             // AH=0Fh — Get current video mode
             cpu.regs[R_AX] = ((uint16_t)video.cols << 8) | video.modeNumber();
             cpu.regs[R_BX] = (cpu.regs[R_BX] & 0x00FF); // BH=0 (page)
+            return true;
+        }
+        case 0x12: {
+            // AH=12h — Alternate select (video subsystem config)
+            uint8_t bl = cpu.regs[R_BX] & 0xFF;
+            if (bl == 0x10) {
+                // BL=10h — Get EGA/VGA information
+                // BH=00h: color mode, BL=03h: 256KB video memory
+                // CH=00h: feature bits, CL=09h: switch settings (EGA/VGA color)
+                cpu.regs[R_BX] = 0x0003; // BH=0 (color), BL=3 (256KB)
+                cpu.regs[R_CX] = 0x0009; // CH=0 (features), CL=9 (switches)
+            }
             return true;
         }
         default:

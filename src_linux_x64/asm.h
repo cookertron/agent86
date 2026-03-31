@@ -100,6 +100,8 @@ public:
     const std::vector<HexDump>& hexDumps() const { return hex_dumps_; }
     const std::string& screenMode() const { return screen_mode_; }
     int64_t origin() const { return origin_; }
+    int64_t bssStart() const { return bss_start_; }
+    int64_t bssEnd() const { return in_bss_ ? current_addr_ : -1; }
 
 private:
     // Parsing
@@ -158,6 +160,8 @@ private:
     std::string screen_mode_;
     std::vector<int> pass1_sizes_;  // per-line estimated sizes from pass 1
     bool directive_pending_ = false; // true when runtime directive at current_addr_ needs NOP before next label
+    bool in_bss_ = false;            // true after SECTION .bss
+    int64_t bss_start_ = -1;         // address where BSS begins (-1 = no BSS)
 
     void error(int line, const std::string& source, const std::string& msg);
     void recordDebug(int line_index, const std::string& source_line);
